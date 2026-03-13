@@ -1,0 +1,5 @@
+node_modules/
+.wwebjs_auth/
+group_cache.json
+Comprobantes_Descargados.docx
+.DS_Store
