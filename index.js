@@ -2,6 +2,10 @@ const fs = require('fs');
 const qrcode = require('qrcode-terminal');
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const { prompt } = require('enquirer');
+
+// Configuración de reintentos
+const MAX_RETRIES = 3;
+const RETRY_DELAY_MS = 5000;
 const {
   Document,
   Packer,
@@ -19,6 +23,111 @@ const {
 
 const GROUP_NAME = 'TRANSFERENCIAS RED POSTAL POBLADO';
 
+// Función auxiliar para esperar
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Función para crear el cliente con la configuración correcta
+function createClient() {
+  return new Client({
+    authStrategy: new LocalAuth({ dataPath: './.wwebjs_auth' }),
+    webVersionCache: {
+      type: 'remote',
+      remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.2412.54.html',
+    },
+    puppeteer: {
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--no-first-run',
+        '--disable-gpu',
+        '--disable-extensions',
+        '--disable-background-networking',
+        '--disable-background-timer-throttling',
+        '--disable-backgrounding-occluded-windows',
+        '--disable-breakpad',
+        '--disable-component-extensions-with-background-pages',
+        '--disable-features=TranslateUI',
+        '--disable-ipc-flooding-protection',
+        '--disable-renderer-backgrounding',
+        '--enable-features=NetworkService,NetworkServiceInProcess',
+        '--force-color-profile=srgb',
+        '--metrics-recording-only',
+        '--single-process'
+      ],
+      protocolTimeout: 180000, // 3 minutos de timeout para protocolos
+      timeout: 120000 // 2 minutos de timeout general
+    }
+  });
+}
+
+async function initializeClientWithRetry(client, startDate, endDate, attempt = 1) {
+  return new Promise((resolve, reject) => {
+    let initialized = false;
+    let timeoutId;
+    
+    const cleanup = () => {
+      if (timeoutId) clearTimeout(timeoutId);
+      client.removeAllListeners('qr');
+      client.removeAllListeners('ready');
+      client.removeAllListeners('auth_failure');
+      client.removeAllListeners('disconnected');
+    };
+
+    client.on('qr', (qr) => {
+      console.log('\n======================================================');
+      console.log(' POR FAVOR ESCANEA EL SIGUIENTE CÓDIGO QR CON WHATSAPP');
+      console.log('======================================================\n');
+      qrcode.generate(qr, { small: true });
+    });
+
+    client.on('auth_failure', (msg) => {
+      console.error('❌ Error de autenticación:', msg);
+      cleanup();
+      reject(new Error('Authentication failed'));
+    });
+
+    client.on('disconnected', (reason) => {
+      console.log('⚠ Cliente desconectado:', reason);
+      if (!initialized) {
+        cleanup();
+        reject(new Error(`Disconnected: ${reason}`));
+      }
+    });
+
+    client.on('ready', async () => {
+      initialized = true;
+      cleanup();
+      console.log('✅ Cliente de WhatsApp listo y conectado.');
+      try {
+        await processGroupMessages(client, startDate, endDate);
+        resolve();
+      } catch (error) {
+        reject(error);
+      }
+    });
+
+    // Timeout de seguridad para la inicialización (3 minutos)
+    timeoutId = setTimeout(() => {
+      if (!initialized) {
+        cleanup();
+        reject(new Error('Timeout durante la inicialización'));
+      }
+    }, 180000);
+
+    console.log(`🔄 Iniciando cliente de WhatsApp (intento ${attempt}/${MAX_RETRIES})...`);
+    
+    client.initialize().catch(err => {
+      cleanup();
+      reject(err);
+    });
+  });
+}
+
 async function main() {
   console.log('\n======================================================');
   console.log(' CONFIGURACIÓN DE FECHAS DE DESCARGA');
@@ -34,6 +143,11 @@ async function main() {
     },
     {
       type: 'input',
+      name: 'startTime',
+      message: 'Hora de INICIO de AYER (HH:MM) [Presiona Enter para 08:30]:'
+    },
+    {
+      type: 'input',
       name: 'endDate',
       message: 'Fecha de FIN (YYYY-MM-DD) [Presiona Enter para HOY]:'
     }
@@ -41,16 +155,25 @@ async function main() {
 
   const answers = await prompt(questions);
 
+  // Parsear la hora de inicio (por defecto 8:30am)
+  let startHour = 8;
+  let startMinute = 30;
+  if (answers.startTime && answers.startTime.trim() !== '') {
+    const timeParts = answers.startTime.trim().split(':');
+    startHour = parseInt(timeParts[0]) || 8;
+    startMinute = parseInt(timeParts[1]) || 30;
+  }
+
   const startDate = new Date();
   if (answers.startDate && answers.startDate.trim() !== '') {
     const parts = answers.startDate.trim().split('-');
     startDate.setFullYear(parseInt(parts[0]));
     startDate.setMonth(parseInt(parts[1]) - 1);
     startDate.setDate(parseInt(parts[2]));
-    startDate.setHours(0, 0, 0, 0);
+    startDate.setHours(startHour, startMinute, 0, 0);
   } else {
     startDate.setDate(startDate.getDate() - 1);
-    startDate.setHours(0, 0, 0, 0);
+    startDate.setHours(startHour, startMinute, 0, 0);
   }
 
   const endDate = new Date();
@@ -59,46 +182,64 @@ async function main() {
     endDate.setFullYear(parseInt(parts[0]));
     endDate.setMonth(parseInt(parts[1]) - 1);
     endDate.setDate(parseInt(parts[2]));
-    endDate.setHours(23, 59, 59, 999);
+    // La hora de fin es la hora de inicio del día siguiente menos 1 segundo
+    endDate.setHours(startHour, startMinute - 1, 59, 999);
   } else {
-    endDate.setHours(23, 59, 59, 999);
+    // Hoy hasta la hora de inicio del siguiente ciclo (mañana a las 8:30) menos 1 segundo
+    endDate.setDate(endDate.getDate() + 1);
+    endDate.setHours(startHour, startMinute - 1, 59, 999);
   }
 
   console.log(`\n📅 Rango seleccionado: ${startDate.toLocaleString()} HASTA ${endDate.toLocaleString()}\n`);
 
-  const client = new Client({
-    authStrategy: new LocalAuth({ dataPath: './.wwebjs_auth' }),
-    webVersionCache: {
-      type: 'remote',
-      remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.2412.54.html',
-    },
-    puppeteer: {
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-accelerated-2d-canvas', '--no-first-run', '--disable-gpu'],
-      protocolTimeout: 0,
-      timeout: 0
-    }
-  });
-
-  client.on('qr', (qr) => {
-    console.log('\n======================================================');
-    console.log(' POR FAVOR ESCANEA EL SIGUIENTE CÓDIGO QR CON WHATSAPP');
-    console.log('======================================================\n');
-    qrcode.generate(qr, { small: true });
-  });
-
-  client.on('ready', async () => {
-    console.log('✅ Cliente de WhatsApp listo y conectado.');
+  let lastError;
+  
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    let client;
     try {
-      await processGroupMessages(client, startDate, endDate);
-    } catch (error) {
-      console.error('❌ Error procesando los mensajes:', error);
-    } finally {
-      console.log('▶ Proceso finalizado. Puedes cerrar la aplicación.');
+      client = createClient();
+      await initializeClientWithRetry(client, startDate, endDate, attempt);
+      console.log('▶ Proceso finalizado exitosamente.');
       process.exit(0);
+    } catch (error) {
+      lastError = error;
+      const isContextDestroyed = error.message && (
+        error.message.includes('Execution context was destroyed') ||
+        error.message.includes('Protocol error') ||
+        error.message.includes('Target closed') ||
+        error.message.includes('Session closed')
+      );
+      
+      console.error(`\n❌ Error en intento ${attempt}/${MAX_RETRIES}:`, error.message);
+      
+      // Intentar cerrar el cliente si existe
+      if (client) {
+        try {
+          await client.destroy();
+        } catch (destroyErr) {
+          // Ignorar errores al destruir
+        }
+      }
+      
+      if (attempt < MAX_RETRIES) {
+        if (isContextDestroyed) {
+          console.log(`\n⚠ Se detectó error de contexto destruido. Esto puede ocurrir cuando WhatsApp Web se actualiza.`);
+          console.log(`🔄 Reintentando en ${RETRY_DELAY_MS / 1000} segundos...\n`);
+        } else {
+          console.log(`🔄 Reintentando en ${RETRY_DELAY_MS / 1000} segundos...\n`);
+        }
+        await sleep(RETRY_DELAY_MS);
+      }
     }
-  });
-
-  client.initialize();
+  }
+  
+  console.error('\n❌ Se agotaron todos los intentos. Error final:', lastError?.message);
+  console.log('\n💡 Sugerencias para resolver el problema:');
+  console.log('   1. Elimina la carpeta .wwebjs_auth y vuelve a escanear el QR');
+  console.log('   2. Asegúrate de tener una conexión a internet estable');
+  console.log('   3. Intenta cerrar otras instancias de WhatsApp Web');
+  console.log('   4. Reinicia la aplicación\n');
+  process.exit(1);
 }
 
 async function processGroupMessages(client, startDate, endDate) {
@@ -123,69 +264,42 @@ async function processGroupMessages(client, startDate, endDate) {
   }
 
   if (!group) {
-    console.log(`Buscando el grupo: "${GROUP_NAME}" (Puede tardar un par de minutos la primera vez)...`);
+    console.log(`Buscando el grupo: "${GROUP_NAME}" (Puede tardar varios minutos la primera vez)...`);
+    console.log(`⏳ Por favor espera mientras se cargan todos los chats...\n`);
     
-    // Para cuentas MUY grandes, getChats() puede fallar o tardar horas.
-    // Usamos una estrategia mixta: Intentamos buscar en los chats más recientes,
-    // y si tarda demasiado, le pedimos al usuario que interactúe.
-    
-    group = await new Promise(async (resolve) => {
-      let found = false;
+    try {
+      // Cargar todos los chats - puede tardar varios minutos en cuentas grandes
+      const chats = await client.getChats();
+      console.log(`✅ Se cargaron ${chats.length} chats.`);
       
-      // Estrategia 1: Escuchar si llega algún mensaje nuevo a ese grupo
-      const tempListener = (msg) => {
-        if (msg.from.includes('@g.us')) {
-          msg.getChat().then(chat => {
-            if (chat.name && chat.name.toUpperCase().includes(GROUP_NAME.toUpperCase())) {
-              if (!found) {
-                found = true;
-                client.removeListener('message', tempListener);
-                resolve(chat);
-              }
-            }
-          });
+      // Buscar el grupo por nombre (parcial, ignorando mayúsculas/minúsculas)
+      const matchedGroup = chats.find(c => 
+        c.isGroup && c.name && c.name.toUpperCase().includes(GROUP_NAME.toUpperCase())
+      );
+      
+      if (matchedGroup) {
+        group = matchedGroup;
+        console.log(`✅ Grupo localizado: ${group.name}`);
+        fs.writeFileSync(cacheFile, JSON.stringify({ groupId: group.id._serialized }));
+        console.log(`💾 ID del grupo guardado en caché para futuras descargas inmediatas.`);
+      } else {
+        // Mostrar los grupos disponibles para ayudar al usuario
+        const availableGroups = chats.filter(c => c.isGroup && c.name);
+        console.log(`\n❌ No se encontró el grupo "${GROUP_NAME}".`);
+        console.log(`\n📋 Grupos disponibles (${availableGroups.length}):`);
+        availableGroups.slice(0, 20).forEach((g, i) => {
+          console.log(`   ${i + 1}. ${g.name}`);
+        });
+        if (availableGroups.length > 20) {
+          console.log(`   ... y ${availableGroups.length - 20} grupos más.`);
         }
-      };
-      client.on('message', tempListener);
-
-      // Estrategia 2: Intentar getChats normal, pero con timeout de seguridad (30 segs)
-      const timeoutId = setTimeout(() => {
-        if (!found) {
-          console.log('\n======================================================');
-          console.log('⚠ TU CUENTA TIENE DEMASIADOS CHATS Y TARDA DEMASIADO ⚠');
-          console.log(`Por favor, ve a WhatsApp en tu celular y ENVÍA UN MENSAJE (cualquiera) al grupo:`);
-          console.log(`"${GROUP_NAME}"`);
-          console.log('Esto permitirá localizar el grupo instantáneamente.');
-          console.log('======================================================\n');
-        }
-      }, 15000);
-
-      try {
-        const chats = await client.getChats();
-        if (!found) {
-          const matchedGroup = chats.find(c => c.isGroup && c.name.toUpperCase().includes(GROUP_NAME.toUpperCase()));
-          if (matchedGroup) {
-            found = true;
-            client.removeListener('message', tempListener);
-            clearTimeout(timeoutId);
-            resolve(matchedGroup);
-          } else {
-             // Dejar que la estrategia 1 lo resuelva si no estaba en la lista local
-          }
-        }
-      } catch (e) {
-        // Ignorar error si getChats colapsa, la estrategia 1 seguirá activa
+        console.log(`\n💡 Verifica que el nombre del grupo sea correcto y modifica GROUP_NAME en el código.`);
+        return;
       }
-    });
-
-    if (!group) {
-      console.log(`❌ No se encontró el grupo "${GROUP_NAME}". Verifica el nombre exacto.`);
+    } catch (e) {
+      console.error('❌ Error al cargar los chats:', e.message);
       return;
     }
-    console.log(`✅ Grupo localizado: ${group.name}`);
-    
-    fs.writeFileSync(cacheFile, JSON.stringify({ groupId: group.id._serialized }));
-    console.log(`💾 ID del grupo guardado en caché para futuras descargas inmediatas.`);
   }
 
   const startTimestamp = Math.floor(startDate.getTime() / 1000);
