@@ -62,8 +62,8 @@ function createClient() {
         '--metrics-recording-only'
         // NOTA: --single-process fue REMOVIDO porque causa "frame detached" en Windows
       ],
-      protocolTimeout: 180000, // 3 minutos de timeout para protocolos
-      timeout: 120000 // 2 minutos de timeout general
+      protocolTimeout: 600000, // 10 minutos de timeout para protocolos (aumentado significativamente)
+      timeout: 300000 // 5 minutos de timeout general (aumentado significativamente)
     }
   });
 }
@@ -219,6 +219,12 @@ async function main() {
         error.message.includes('frame detached')
       );
       
+      const isRuntimeTimeout = error.message && (
+        error.message.includes('runtime.callfuncuint timed out') ||
+        error.message.includes('protocolTimeout') ||
+        error.message.includes('timed out')
+      );
+      
       console.error(`\n❌ Error en intento ${attempt}/${MAX_RETRIES}:`, error.message);
       
       // Intentar cerrar el cliente si existe
@@ -237,6 +243,10 @@ async function main() {
         } else if (isFrameDetached) {
           console.log(`\n⚠ Se detectó error "frame detached" (común en Windows).`);
           console.log(`💡 Se ha removido el flag --single-process para evitar este error.`);
+          console.log(`🔄 Reintentando en ${RETRY_DELAY_MS / 1000} segundos...\n`);
+        } else if (isRuntimeTimeout) {
+          console.log(`\n⚠ Se detectó error de timeout (runtime.callfuncuint).`);
+          console.log(`💡 Los timeouts ya fueron aumentados a 10 minutos para protocolos y 5 minutos general.`);
           console.log(`🔄 Reintentando en ${RETRY_DELAY_MS / 1000} segundos...\n`);
         } else {
           console.log(`🔄 Reintentando en ${RETRY_DELAY_MS / 1000} segundos...\n`);
