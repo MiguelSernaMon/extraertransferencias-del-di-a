@@ -18,7 +18,10 @@ const {
   WidthType,
   BorderStyle,
   VerticalAlign,
-  AlignmentType
+  AlignmentType,
+  Header,
+  PageNumber,
+  NumberFormat
 } = require('docx');
 
 const GROUP_NAME = 'TRANSFERENCIAS RED POSTAL POBLADO';
@@ -383,16 +386,23 @@ async function createWordDocument(receipts) {
       const elements = [];
       const isSecondOrMorePageForSender = i > 0;
 
-      // EL TÍTULO SUPERIOR (Solo una vez por página)
-      elements.push(new Paragraph({
+      // CREAR HEADER DE PÁGINA - Esto garantiza que SIEMPRE aparezca arriba en la impresión
+      const pageHeader = new Header({
         children: [
-          new TextRun({ text: `Mensajero: `, bold: true, size: 28 }),
-          new TextRun({ text: `${senderName}${isSecondOrMorePageForSender ? ' (Continuación)' : ''}`, bold: false, size: 28 }),
-          new TextRun({ text: `    |    Total: ________________________`, bold: true, size: 28 })
-        ],
-        alignment: AlignmentType.CENTER,
-        spacing: { before: 100, after: 100 }
-      }));
+          new Paragraph({
+            children: [
+              new TextRun({ text: `Mensajero: `, bold: true, size: 32 }),
+              new TextRun({ text: `${senderName}${isSecondOrMorePageForSender ? ' (Continuación)' : ''}`, bold: true, size: 32 }),
+              new TextRun({ text: `    |    Total: ________________________`, bold: true, size: 28 })
+            ],
+            alignment: AlignmentType.CENTER,
+            spacing: { before: 0, after: 200 },
+            border: {
+              bottom: { style: BorderStyle.SINGLE, size: 6, color: "000000" }
+            }
+          })
+        ]
+      });
       
       // LA TABLA (2 columnas, max 3 filas)
       const rows = [];
@@ -415,7 +425,7 @@ async function createWordDocument(receipts) {
             }));
           }
         }
-        rows.push(new TableRow({ children: rowCells, height: { value: 4800, rule: "exact" } })); // Alto de fila ajustado para aprovechar espacio
+        rows.push(new TableRow({ children: rowCells, height: { value: 5200, rule: "exact" } })); // Alto de fila reducido para imágenes más pequeñas
       }
       
       const table = new Table({
@@ -441,8 +451,11 @@ async function createWordDocument(receipts) {
       sections.push({
         properties: {
           page: {
-            margin: { top: 400, right: 400, bottom: 400, left: 400 } // márgenes muy delgados
+            margin: { top: 850, right: 400, bottom: 400, left: 400 } // margen superior para header
           }
+        },
+        headers: {
+          default: pageHeader  // HEADER FIJO - Garantiza que el nombre del mensajero SIEMPRE aparezca arriba
         },
         children: elements
       });
@@ -466,12 +479,12 @@ function createReceiptCell(receipt) {
       size: 50,
       type: WidthType.PERCENTAGE,
     },
-    // Margen interno entre celdas un poco más reducido para aprovechar espacio
+    // Margen interno reducido para imágenes más pegadas
     margins: {
-      top: 50,
-      bottom: 50,
-      left: 100,
-      right: 100,
+      top: 20,
+      bottom: 20,
+      left: 50,
+      right: 50,
     },
     verticalAlign: VerticalAlign.CENTER,
     borders: { // Borde del campo del comprobante para recortar/separar
@@ -484,17 +497,17 @@ function createReceiptCell(receipt) {
       new Paragraph({
         alignment: AlignmentType.CENTER,
         children: [
-          new TextRun({ text: `${receipt.date}`, bold: true, size: 24 })
+          new TextRun({ text: `${receipt.date}`, bold: true, size: 20 })
         ]
       }),
       new Paragraph({
         alignment: AlignmentType.CENTER,
         children: [
-          new ImageRun({
+            new ImageRun({
             data: receipt.imageBuffer,
             transformation: {
-              width: 320,    // Imágenes mucho más grandes para aprovechar la hoja sin margenes
-              height: 420
+              width: 250,    // Ancho más pequeño para ahorrar espacio
+              height: 400    // Alto ajustado para ratio más vertical (1:1.6)
             }
           })
         ]
