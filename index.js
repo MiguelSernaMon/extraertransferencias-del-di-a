@@ -59,8 +59,8 @@ function createClient() {
         '--disable-renderer-backgrounding',
         '--enable-features=NetworkService,NetworkServiceInProcess',
         '--force-color-profile=srgb',
-        '--metrics-recording-only',
-        '--single-process'
+        '--metrics-recording-only'
+        // NOTA: --single-process fue REMOVIDO porque causa "frame detached" en Windows
       ],
       protocolTimeout: 180000, // 3 minutos de timeout para protocolos
       timeout: 120000 // 2 minutos de timeout general
@@ -213,6 +213,12 @@ async function main() {
         error.message.includes('Session closed')
       );
       
+      const isFrameDetached = error.message && (
+        error.message.includes('Navigating frame was detached') ||
+        error.message.includes('frame was detached') ||
+        error.message.includes('frame detached')
+      );
+      
       console.error(`\n❌ Error en intento ${attempt}/${MAX_RETRIES}:`, error.message);
       
       // Intentar cerrar el cliente si existe
@@ -228,6 +234,10 @@ async function main() {
         if (isContextDestroyed) {
           console.log(`\n⚠ Se detectó error de contexto destruido. Esto puede ocurrir cuando WhatsApp Web se actualiza.`);
           console.log(`🔄 Reintentando en ${RETRY_DELAY_MS / 1000} segundos...\n`);
+        } else if (isFrameDetached) {
+          console.log(`\n⚠ Se detectó error "frame detached" (común en Windows).`);
+          console.log(`💡 Se ha removido el flag --single-process para evitar este error.`);
+          console.log(`🔄 Reintentando en ${RETRY_DELAY_MS / 1000} segundos...\n`);
         } else {
           console.log(`🔄 Reintentando en ${RETRY_DELAY_MS / 1000} segundos...\n`);
         }
@@ -241,7 +251,8 @@ async function main() {
   console.log('   1. Elimina la carpeta .wwebjs_auth y vuelve a escanear el QR');
   console.log('   2. Asegúrate de tener una conexión a internet estable');
   console.log('   3. Intenta cerrar otras instancias de WhatsApp Web');
-  console.log('   4. Reinicia la aplicación\n');
+  console.log('   4. Reinicia la aplicación');
+  console.log('   5. Usa Node.js versión 18.x o 20.x (versiones LTS recomendadas)\n');
   process.exit(1);
 }
 
