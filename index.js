@@ -152,7 +152,12 @@ async function main() {
     {
       type: 'input',
       name: 'endDate',
-      message: 'Fecha de FIN (YYYY-MM-DD) [Enter = HOY]:'
+      message: 'Fecha de FIN   (YYYY-MM-DD) [Enter = HOY]:'
+    },
+    {
+      type: 'input',
+      name: 'endTime',
+      message: 'Hora de FIN    (HH:MM)      [Enter = 23:59]:'
     }
   ];
 
@@ -187,23 +192,29 @@ async function main() {
     startDate = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1, startHour, startMinute, 0, 0);
   }
 
-  // ── Fecha de FIN ─────────────────────────────────────────────────────────
-  // La fecha de FIN es el DÍA indicado (o HOY si se dejó en blanco)
-  // hasta el último instante antes de la hora de inicio del siguiente ciclo.
-  // Eso significa: misma hora de inicio pero en el día FIN (no un día después).
-  // Por ej.: inicio 15/03 08:30 → fin 16/03 08:29:59.999
+  // ── Parsear hora de FIN (por defecto 23:59) ──────────────────────────
+  let endHour = 23;
+  let endMinute = 59;
+  if (answers.endTime && answers.endTime.trim() !== '') {
+    const timeParts = answers.endTime.trim().split(':');
+    endHour   = parseInt(timeParts[0], 10);
+    endMinute = parseInt(timeParts[1], 10);
+    if (isNaN(endHour)   || endHour   < 0 || endHour   > 23) endHour   = 23;
+    if (isNaN(endMinute) || endMinute < 0 || endMinute > 59) endMinute = 59;
+  }
+
+  // ── Fecha de FIN ───────────────────────────────────────────────
   let endDate;
   if (answers.endDate && answers.endDate.trim() !== '') {
     const parts = answers.endDate.trim().split('-');
     const year  = parseInt(parts[0], 10);
     const month = parseInt(parts[1], 10) - 1;
     const day   = parseInt(parts[2], 10);
-    // Fin = día indicado a las 23:59:59 (incluye todo el día)
-    endDate = new Date(year, month, day, 23, 59, 59, 999);
+    endDate = new Date(year, month, day, endHour, endMinute, 59, 999);
   } else {
-    // HOY a las 23:59:59 (incluye todo el día de hoy)
+    // HOY a la hora de fin indicada
     const now = new Date();
-    endDate = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999);
+    endDate = new Date(now.getFullYear(), now.getMonth(), now.getDate(), endHour, endMinute, 59, 999);
   }
 
   console.log(`\n📅 Rango seleccionado:`);
@@ -492,10 +503,10 @@ async function createWordDocument(receipts) {
           }
         }
 
-        // Altura de fila: ~5500 twips ≈ 9.7 cm → caben 2 filas en una hoja carta vertical
+        // Altura de fila: ~6000 twips ≈ 10.6 cm → ajustado para caber exactamente 2 filas en la página
         rows.push(new TableRow({
           children: cells,
-          height: { value: 5500, rule: 'atLeast' }
+          height: { value: 6000, rule: 'atLeast' }
         }));
       }
 
@@ -561,21 +572,21 @@ function createReceiptCell(receipt) {
   return new TableCell({
     // 3 columnas → cada una ocupa ~33% del ancho útil
     width:  { size: 3333, type: WidthType.DXA },
-    margins: { top: 50, bottom: 50, left: 60, right: 60 },
+    margins: { top: 0, bottom: 0, left: 0, right: 0 }, // Eliminar márgenes verticales
     verticalAlign: VerticalAlign.CENTER,
     borders: {
-      top:    { style: BorderStyle.SINGLE, size: 2, color: 'aaaaaa' },
-      bottom: { style: BorderStyle.SINGLE, size: 2, color: 'aaaaaa' },
-      left:   { style: BorderStyle.SINGLE, size: 4, color: '003399' },
-      right:  { style: BorderStyle.SINGLE, size: 4, color: '003399' },
+      top:    { style: BorderStyle.SINGLE, size: 1, color: 'cccccc' }, // Bordes más delgados
+      bottom: { style: BorderStyle.SINGLE, size: 1, color: 'cccccc' },
+      left:   { style: BorderStyle.SINGLE, size: 1, color: 'cccccc' }, // Bordes más delgados
+      right:  { style: BorderStyle.SINGLE, size: 1, color: 'cccccc' },
     },
     children: [
       // Fecha y hora del comprobante
       new Paragraph({
         alignment: AlignmentType.CENTER,
-        spacing: { before: 0, after: 50 },
+        spacing: { before: 0, after: 5 }, // Reducir aún más el espacio después de la fecha
         children: [
-          new TextRun({ text: receipt.date, bold: true, size: 16, color: '333333' })
+          new TextRun({ text: receipt.date, bold: true, size: 12, color: '333333' }) // Texto aún más pequeño
         ]
       }),
       // Imagen del comprobante
@@ -586,8 +597,8 @@ function createReceiptCell(receipt) {
           new ImageRun({
             data: receipt.imageBuffer,
             transformation: {
-              width:  155,   // ~33% del ancho carta menos márgenes (3 columnas)
-              height: 300    // Alto proporcional (ratio ~1:1.94)
+              width:  230,   // Ajustado para caber mejor en el espacio disponible
+              height: 420    // Alto proporcional manteniendo ratio ~1:1.83
             }
           })
         ]
