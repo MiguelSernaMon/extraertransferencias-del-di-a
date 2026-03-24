@@ -19,9 +19,7 @@ const {
   BorderStyle,
   VerticalAlign,
   AlignmentType,
-  Header,
-  PageNumber,
-  NumberFormat
+  Header
 } = require('docx');
 
 const GROUP_NAME = 'TRANSFERENCIAS RED POSTAL POBLADO';
@@ -60,10 +58,9 @@ function createClient() {
         '--enable-features=NetworkService,NetworkServiceInProcess',
         '--force-color-profile=srgb',
         '--metrics-recording-only'
-        // NOTA: --single-process fue REMOVIDO porque causa "frame detached" en Windows
       ],
-      protocolTimeout: 600000, // 10 minutos de timeout para protocolos (aumentado significativamente)
-      timeout: 300000 // 5 minutos de timeout general (aumentado significativamente)
+      protocolTimeout: 600000,
+      timeout: 300000
     }
   });
 }
@@ -131,69 +128,87 @@ async function initializeClientWithRetry(client, startDate, endDate, attempt = 1
   });
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// FUNCIÓN PRINCIPAL - Parseo de fechas CORREGIDO
+// ─────────────────────────────────────────────────────────────────────────────
 async function main() {
   console.log('\n======================================================');
   console.log(' CONFIGURACIÓN DE FECHAS DE DESCARGA');
   console.log('======================================================');
   console.log('Ingresa la fecha en formato YYYY-MM-DD (ej: 2026-03-12).');
-  console.log('Si dejas en blanco, usará por defecto AYER y HOY respectivamente.\n');
+  console.log('Si dejas en blanco, usará AYER como inicio y HOY como fin.\n');
 
   const questions = [
     {
       type: 'input',
       name: 'startDate',
-      message: 'Fecha de INICIO (YYYY-MM-DD) [Presiona Enter para AYER]:'
+      message: 'Fecha de INICIO (YYYY-MM-DD) [Enter = AYER]:'
     },
     {
       type: 'input',
       name: 'startTime',
-      message: 'Hora de INICIO de AYER (HH:MM) [Presiona Enter para 08:30]:'
+      message: 'Hora de INICIO (HH:MM) [Enter = 08:30]:'
     },
     {
       type: 'input',
       name: 'endDate',
-      message: 'Fecha de FIN (YYYY-MM-DD) [Presiona Enter para HOY]:'
+      message: 'Fecha de FIN (YYYY-MM-DD) [Enter = HOY]:'
     }
   ];
 
   const answers = await prompt(questions);
 
-  // Parsear la hora de inicio (por defecto 8:30am)
+  // ── Parsear hora de inicio (por defecto 08:30) ──────────────────────────
   let startHour = 8;
   let startMinute = 30;
   if (answers.startTime && answers.startTime.trim() !== '') {
     const timeParts = answers.startTime.trim().split(':');
-    startHour = parseInt(timeParts[0]) || 8;
-    startMinute = parseInt(timeParts[1]) || 30;
+    // Usamos exactamente lo que el usuario escribe, sin sumar nada
+    startHour   = parseInt(timeParts[0], 10);
+    startMinute = parseInt(timeParts[1], 10);
+    // Validación básica
+    if (isNaN(startHour) || startHour < 0 || startHour > 23)   startHour   = 8;
+    if (isNaN(startMinute) || startMinute < 0 || startMinute > 59) startMinute = 30;
   }
 
-  const startDate = new Date();
+  // ── Fecha de INICIO ──────────────────────────────────────────────────────
+  // Importante: construimos la fecha manualmente para evitar que setDate()
+  // interactúe con los meses de forma inesperada cuando mezclamos setFullYear/setMonth/setDate.
+  let startDate;
   if (answers.startDate && answers.startDate.trim() !== '') {
     const parts = answers.startDate.trim().split('-');
-    startDate.setFullYear(parseInt(parts[0]));
-    startDate.setMonth(parseInt(parts[1]) - 1);
-    startDate.setDate(parseInt(parts[2]));
-    startDate.setHours(startHour, startMinute, 0, 0);
+    const year  = parseInt(parts[0], 10);
+    const month = parseInt(parts[1], 10) - 1; // 0-indexed
+    const day   = parseInt(parts[2], 10);
+    startDate = new Date(year, month, day, startHour, startMinute, 0, 0);
   } else {
-    startDate.setDate(startDate.getDate() - 1);
-    startDate.setHours(startHour, startMinute, 0, 0);
+    // AYER a la hora indicada
+    const now = new Date();
+    startDate = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1, startHour, startMinute, 0, 0);
   }
 
-  const endDate = new Date();
+  // ── Fecha de FIN ─────────────────────────────────────────────────────────
+  // La fecha de FIN es el DÍA indicado (o HOY si se dejó en blanco)
+  // hasta el último instante antes de la hora de inicio del siguiente ciclo.
+  // Eso significa: misma hora de inicio pero en el día FIN (no un día después).
+  // Por ej.: inicio 15/03 08:30 → fin 16/03 08:29:59.999
+  let endDate;
   if (answers.endDate && answers.endDate.trim() !== '') {
     const parts = answers.endDate.trim().split('-');
-    endDate.setFullYear(parseInt(parts[0]));
-    endDate.setMonth(parseInt(parts[1]) - 1);
-    endDate.setDate(parseInt(parts[2]));
-    // La hora de fin es la hora de inicio del día siguiente menos 1 segundo
-    endDate.setHours(startHour, startMinute - 1, 59, 999);
+    const year  = parseInt(parts[0], 10);
+    const month = parseInt(parts[1], 10) - 1;
+    const day   = parseInt(parts[2], 10);
+    // Fin = día indicado a las 23:59:59 (incluye todo el día)
+    endDate = new Date(year, month, day, 23, 59, 59, 999);
   } else {
-    // Hoy hasta la hora de inicio del siguiente ciclo (mañana a las 8:30) menos 1 segundo
-    endDate.setDate(endDate.getDate() + 1);
-    endDate.setHours(startHour, startMinute - 1, 59, 999);
+    // HOY a las 23:59:59 (incluye todo el día de hoy)
+    const now = new Date();
+    endDate = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999);
   }
 
-  console.log(`\n📅 Rango seleccionado: ${startDate.toLocaleString()} HASTA ${endDate.toLocaleString()}\n`);
+  console.log(`\n📅 Rango seleccionado:`);
+  console.log(`   INICIO: ${startDate.toLocaleString('es-CO')}`);
+  console.log(`   FIN:    ${endDate.toLocaleString('es-CO')}\n`);
 
   let lastError;
   
@@ -227,7 +242,6 @@ async function main() {
       
       console.error(`\n❌ Error en intento ${attempt}/${MAX_RETRIES}:`, error.message);
       
-      // Intentar cerrar el cliente si existe
       if (client) {
         try {
           await client.destroy();
@@ -238,15 +252,13 @@ async function main() {
       
       if (attempt < MAX_RETRIES) {
         if (isContextDestroyed) {
-          console.log(`\n⚠ Se detectó error de contexto destruido. Esto puede ocurrir cuando WhatsApp Web se actualiza.`);
+          console.log(`\n⚠ Se detectó error de contexto destruido.`);
           console.log(`🔄 Reintentando en ${RETRY_DELAY_MS / 1000} segundos...\n`);
         } else if (isFrameDetached) {
           console.log(`\n⚠ Se detectó error "frame detached" (común en Windows).`);
-          console.log(`💡 Se ha removido el flag --single-process para evitar este error.`);
           console.log(`🔄 Reintentando en ${RETRY_DELAY_MS / 1000} segundos...\n`);
         } else if (isRuntimeTimeout) {
-          console.log(`\n⚠ Se detectó error de timeout (runtime.callfuncuint).`);
-          console.log(`💡 Los timeouts ya fueron aumentados a 10 minutos para protocolos y 5 minutos general.`);
+          console.log(`\n⚠ Se detectó error de timeout.`);
           console.log(`🔄 Reintentando en ${RETRY_DELAY_MS / 1000} segundos...\n`);
         } else {
           console.log(`🔄 Reintentando en ${RETRY_DELAY_MS / 1000} segundos...\n`);
@@ -266,38 +278,40 @@ async function main() {
   process.exit(1);
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// BÚSQUEDA DE GRUPO — Con caché para acelerar ejecuciones a partir de la 2ª
+// ─────────────────────────────────────────────────────────────────────────────
 async function processGroupMessages(client, startDate, endDate) {
   const cacheFile = './group_cache.json';
-  let group;
+  let group = null;
 
+  // 1) Intentar cargar desde caché (mucho más rápido que getChats())
   if (fs.existsSync(cacheFile)) {
-    console.log(`Buscando el grupo desde el caché...`);
-    const cachedData = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
+    console.log('📦 Cargando grupo desde caché...');
     try {
-      // Añadimos un límite de tiempo (5 segundos) por si el ID del grupo guardado ya no existe.
+      const cachedData = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
       group = await Promise.race([
         client.getChatById(cachedData.groupId),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout de caché')), 5000))
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout de caché')), 8000))
       ]);
       console.log(`✅ Grupo cargado desde caché: ${group.name}`);
     } catch (err) {
-      console.log('⚠ El viejo caché no sirvió (tal vez cambiaste de cuenta). Buscando de nuevo...');
-      fs.unlinkSync(cacheFile); // Borramos el caché corrupto/obsoleto
+      console.log('⚠ El caché ya no sirve (¿cambiaste de cuenta?). Buscando de nuevo...');
+      fs.unlinkSync(cacheFile);
       group = null;
     }
   }
 
+  // 2) Si no hay caché, buscar en todos los chats (más lento, solo la primera vez)
   if (!group) {
-    console.log(`Buscando el grupo: "${GROUP_NAME}" (Puede tardar varios minutos la primera vez)...`);
-    console.log(`⏳ Por favor espera mientras se cargan todos los chats...\n`);
+    console.log(`🔍 Buscando el grupo: "${GROUP_NAME}"`);
+    console.log('⏳ Cargando todos los chats (puede tardar varios minutos la primera vez)...\n');
     
     try {
-      // Cargar todos los chats - puede tardar varios minutos en cuentas grandes
       const chats = await client.getChats();
       console.log(`✅ Se cargaron ${chats.length} chats.`);
       
-      // Buscar el grupo por nombre (parcial, ignorando mayúsculas/minúsculas)
-      const matchedGroup = chats.find(c => 
+      const matchedGroup = chats.find(c =>
         c.isGroup && c.name && c.name.toUpperCase().includes(GROUP_NAME.toUpperCase())
       );
       
@@ -305,9 +319,8 @@ async function processGroupMessages(client, startDate, endDate) {
         group = matchedGroup;
         console.log(`✅ Grupo localizado: ${group.name}`);
         fs.writeFileSync(cacheFile, JSON.stringify({ groupId: group.id._serialized }));
-        console.log(`💾 ID del grupo guardado en caché para futuras descargas inmediatas.`);
+        console.log('💾 ID del grupo guardado en caché para futuras búsquedas instantáneas.');
       } else {
-        // Mostrar los grupos disponibles para ayudar al usuario
         const availableGroups = chats.filter(c => c.isGroup && c.name);
         console.log(`\n❌ No se encontró el grupo "${GROUP_NAME}".`);
         console.log(`\n📋 Grupos disponibles (${availableGroups.length}):`);
@@ -327,11 +340,10 @@ async function processGroupMessages(client, startDate, endDate) {
   }
 
   const startTimestamp = Math.floor(startDate.getTime() / 1000);
-  const endTimestamp = Math.floor(endDate.getTime() / 1000);
+  const endTimestamp   = Math.floor(endDate.getTime()   / 1000);
 
-  console.log(`Buscando mensajes...`);
+  console.log('\nBuscando mensajes en el rango de fechas...');
 
-  // Buscamos los últimos mensajes
   const messages = await group.fetchMessages({ limit: 1000 });
   
   const validMessages = messages.filter(msg => {
@@ -344,7 +356,7 @@ async function processGroupMessages(client, startDate, endDate) {
   console.log(`Se encontraron ${validMessages.length} imágenes en el rango de fechas.`);
 
   if (validMessages.length === 0) {
-    console.log('⚠ No hay imágenes para descargar.');
+    console.log('⚠ No hay imágenes para descargar en ese rango.');
     return;
   }
 
@@ -362,12 +374,10 @@ async function processGroupMessages(client, startDate, endDate) {
       }
 
       const contact = await msg.getContact();
-      // contact.name = Nombre como lo tienes guardado tú en tu teléfono
-      // contact.pushname = Nombre que la otra persona se puso en su perfil de WhatsApp
       const senderName = contact.name || contact.pushname || contact.number || 'Desconocido';
       
       const dateObj = new Date(msg.timestamp * 1000);
-      const formattedDate = dateObj.toLocaleString('es-CO'); // ej: 11/3/2026, 14:30:00
+      const formattedDate = dateObj.toLocaleString('es-CO');
 
       const imageBuffer = Buffer.from(media.data, 'base64');
       
@@ -388,147 +398,196 @@ async function processGroupMessages(client, startDate, endDate) {
   await createWordDocument(receipts);
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// CREACIÓN DEL DOCUMENTO WORD
+// Reglas:
+//   • Un solo mensajero por hoja
+//   • Máximo 6 comprobantes por hoja (3 columnas × 2 filas)
+//   • Orientación VERTICAL (portrait)
+//   • Cada nuevo mensajero comienza en una nueva hoja
+//   • El nombre del mensajero se muestra claramente en el header de cada hoja
+// ─────────────────────────────────────────────────────────────────────────────
 async function createWordDocument(receipts) {
-  // Agrupar por mensajero
+  // 1) Agrupar comprobantes por mensajero, manteniendo el orden de llegada
+  const senderOrder = [];
   const groupedReceipts = {};
   receipts.forEach(r => {
-    if (!groupedReceipts[r.senderName]) groupedReceipts[r.senderName] = [];
+    if (!groupedReceipts[r.senderName]) {
+      groupedReceipts[r.senderName] = [];
+      senderOrder.push(r.senderName);
+    }
     groupedReceipts[r.senderName].push(r);
   });
 
   const sections = [];
 
-  // Crear una sección por cada mensajero (y dividirla si tiene más de 6 comprobantes)
-  for (const [senderName, senderReceipts] of Object.entries(groupedReceipts)) {
-    // Dividir en grupos de 6 max por página
-    for (let i = 0; i < senderReceipts.length; i += 6) {
-      const chunk = senderReceipts.slice(i, i + 6);
-      
-      const elements = [];
-      const isSecondOrMorePageForSender = i > 0;
+  // 2) Por cada mensajero, crear tantas secciones (hojas) como sean necesarias
+  for (const senderName of senderOrder) {
+    const senderReceipts = groupedReceipts[senderName];
+    const totalPages = Math.ceil(senderReceipts.length / 6);
 
-      // CREAR HEADER DE PÁGINA - Esto garantiza que SIEMPRE aparezca arriba en la impresión
+    for (let pageIdx = 0; pageIdx < totalPages; pageIdx++) {
+      const chunk = senderReceipts.slice(pageIdx * 6, (pageIdx + 1) * 6);
+      const isExtraPage = pageIdx > 0;
+
+      // ── Header de página: nombre del mensajero bien visible ──────────────
       const pageHeader = new Header({
         children: [
           new Paragraph({
             children: [
-              new TextRun({ text: `Mensajero: `, bold: true, size: 32 }),
-              new TextRun({ text: `${senderName}${isSecondOrMorePageForSender ? ' (Continuación)' : ''}`, bold: true, size: 32 }),
-              new TextRun({ text: `    |    Total: ________________________`, bold: true, size: 28 })
+              new TextRun({
+                text: '📋  MENSAJERO: ',
+                bold: true,
+                size: 36,     // 18pt
+                color: '1a1a1a'
+              }),
+              new TextRun({
+                text: `${senderName.toUpperCase()}${isExtraPage ? '  (Continuación)' : ''}`,
+                bold: true,
+                size: 36,
+                color: '003399'
+              }),
             ],
             alignment: AlignmentType.CENTER,
-            spacing: { before: 0, after: 200 },
+            spacing: { before: 80, after: 120 },
             border: {
-              bottom: { style: BorderStyle.SINGLE, size: 6, color: "000000" }
+              bottom: { style: BorderStyle.THICK, size: 8, color: '003399' }
             }
+          }),
+          new Paragraph({
+            children: [
+              new TextRun({
+                text: `Hoja ${pageIdx + 1} de ${totalPages}   |   Total comprobantes: ${senderReceipts.length}   |   Total a verificar: $ ________________________`,
+                size: 22,
+                color: '555555'
+              })
+            ],
+            alignment: AlignmentType.CENTER,
+            spacing: { before: 60, after: 0 }
           })
         ]
       });
-      
-      // LA TABLA (2 columnas, max 3 filas)
+
+      // ── Tabla: 3 columnas × 2 filas = 6 comprobantes ────────────────────
       const rows = [];
-      for (let rIndex = 0; rIndex < chunk.length; rIndex += 2) {
-        const rowCells = [];
-        for (let col = 0; col < 2; col++) {
-          const receiptIndex = rIndex + col;
-          if (receiptIndex < chunk.length) {
-            rowCells.push(createReceiptCell(chunk[receiptIndex]));
+      for (let rIndex = 0; rIndex < chunk.length; rIndex += 3) {
+        const cells = [];
+
+        for (let col = 0; col < 3; col++) {
+          const idx = rIndex + col;
+          if (idx < chunk.length) {
+            cells.push(createReceiptCell(chunk[idx]));
           } else {
-            // Celda vacía
-            rowCells.push(new TableCell({
-              children: [new Paragraph({text: ""})],
+            // Celda vacía para completar la fila
+            cells.push(new TableCell({
+              children: [new Paragraph({ text: '' })],
+              width: { size: 3333, type: WidthType.DXA },
               borders: {
-                top: { style: BorderStyle.NONE, size: 0, color: "FFFFFF" },
-                bottom: { style: BorderStyle.NONE, size: 0, color: "FFFFFF" },
-                left: { style: BorderStyle.NONE, size: 0, color: "FFFFFF" },
-                right: { style: BorderStyle.NONE, size: 0, color: "FFFFFF" },
+                top:    { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' },
+                bottom: { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' },
+                left:   { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' },
+                right:  { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' },
               }
             }));
           }
         }
-        rows.push(new TableRow({ children: rowCells, height: { value: 5200, rule: "exact" } })); // Alto de fila reducido para imágenes más pequeñas
+
+        // Altura de fila: ~5500 twips ≈ 9.7 cm → caben 2 filas en una hoja carta vertical
+        rows.push(new TableRow({
+          children: cells,
+          height: { value: 5500, rule: 'atLeast' }
+        }));
       }
-      
+
       const table = new Table({
-        rows: rows,
-        width: {
-          size: 100,
-          type: WidthType.PERCENTAGE,
-        },
+        rows,
+        width: { size: 100, type: WidthType.PERCENTAGE },
         borders: {
-          top: { style: BorderStyle.NONE, size: 0, color: "FFFFFF" },
-          bottom: { style: BorderStyle.NONE, size: 0, color: "FFFFFF" },
-          left: { style: BorderStyle.NONE, size: 0, color: "FFFFFF" },
-          right: { style: BorderStyle.NONE, size: 0, color: "FFFFFF" },
-          insideHorizontal: { style: BorderStyle.NONE, size: 0, color: "FFFFFF" },
-          insideVertical: { style: BorderStyle.NONE, size: 0, color: "FFFFFF" },
+          top:              { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' },
+          bottom:           { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' },
+          left:             { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' },
+          right:            { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' },
+          insideHorizontal: { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' },
+          insideVertical:   { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' },
         }
       });
 
-      elements.push(table);
-
-      // Agregamos la hoja (Sección) al word, con MARGEN 0 para ahorrar papel
-      // Usamos margen muy pequeño (400 twips = aprox 0.7cm) porque 0 absoluto puede causar problemas de impresión en algunas impresoras.
+      // ── Sección de la hoja ────────────────────────────────────────────────
+      // Orientación VERTICAL (portrait): width=12240 twips (21.59 cm), height=15840 twips (27.94 cm)
+      // Equivalente a una hoja carta, que es más común que A4 en Colombia.
+      // Para A4 usar: width=11906, height=16838
       sections.push({
         properties: {
           page: {
-            margin: { top: 850, right: 400, bottom: 400, left: 400 } // margen superior para header
+            size: {
+              width:  12240,   // Carta ancho (portrait)
+              height: 15840,   // Carta alto  (portrait)
+              orientation: 'portrait'
+            },
+            margin: {
+              top:    1000,   // ≈1.76 cm  (espacio para header)
+              right:   600,   // ≈1.06 cm
+              bottom:  600,
+              left:    600,
+              header:  300,
+              footer:  200
+            }
           }
         },
         headers: {
-          default: pageHeader  // HEADER FIJO - Garantiza que el nombre del mensajero SIEMPRE aparezca arriba
+          default: pageHeader
         },
-        children: elements
+        children: [table]
       });
     }
   }
 
-  const doc = new Document({
-    sections: sections
-  });
+  const doc = new Document({ sections });
 
   const buffer = await Packer.toBuffer(doc);
   const outPath = 'Comprobantes_Descargados.docx';
   fs.writeFileSync(outPath, buffer);
-  console.log(`\n✅ Documento guardado exitosamente como: ${outPath} en tu carpeta.`);
-  console.log(`Se generaron ${sections.length} páginas/hojas en total.\n`);
+
+  console.log(`\n✅ Documento guardado: ${outPath}`);
+  console.log(`   Mensajeros procesados : ${senderOrder.length}`);
+  console.log(`   Hojas generadas       : ${sections.length}`);
+  console.log(`   Comprobantes totales  : ${receipts.length}\n`);
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// CELDA DE COMPROBANTE — Layout vertical optimizado
+// ─────────────────────────────────────────────────────────────────────────────
 function createReceiptCell(receipt) {
   return new TableCell({
-    width: {
-      size: 50,
-      type: WidthType.PERCENTAGE,
-    },
-    // Margen interno reducido para imágenes más pegadas
-    margins: {
-      top: 20,
-      bottom: 20,
-      left: 50,
-      right: 50,
-    },
+    // 3 columnas → cada una ocupa ~33% del ancho útil
+    width:  { size: 3333, type: WidthType.DXA },
+    margins: { top: 50, bottom: 50, left: 60, right: 60 },
     verticalAlign: VerticalAlign.CENTER,
-    borders: { // Borde del campo del comprobante para recortar/separar
-      top: { style: BorderStyle.SINGLE, size: 1, color: "888888" },
-      bottom: { style: BorderStyle.SINGLE, size: 1, color: "888888" },
-      left: { style: BorderStyle.SINGLE, size: 2, color: "888888" },
-      right: { style: BorderStyle.SINGLE, size: 2, color: "888888" },
+    borders: {
+      top:    { style: BorderStyle.SINGLE, size: 2, color: 'aaaaaa' },
+      bottom: { style: BorderStyle.SINGLE, size: 2, color: 'aaaaaa' },
+      left:   { style: BorderStyle.SINGLE, size: 4, color: '003399' },
+      right:  { style: BorderStyle.SINGLE, size: 4, color: '003399' },
     },
     children: [
+      // Fecha y hora del comprobante
       new Paragraph({
         alignment: AlignmentType.CENTER,
+        spacing: { before: 0, after: 50 },
         children: [
-          new TextRun({ text: `${receipt.date}`, bold: true, size: 20 })
+          new TextRun({ text: receipt.date, bold: true, size: 16, color: '333333' })
         ]
       }),
+      // Imagen del comprobante
       new Paragraph({
         alignment: AlignmentType.CENTER,
+        spacing: { before: 0, after: 0 },
         children: [
-            new ImageRun({
+          new ImageRun({
             data: receipt.imageBuffer,
             transformation: {
-              width: 250,    // Ancho más pequeño para ahorrar espacio
-              height: 400    // Alto ajustado para ratio más vertical (1:1.6)
+              width:  155,   // ~33% del ancho carta menos márgenes (3 columnas)
+              height: 300    // Alto proporcional (ratio ~1:1.94)
             }
           })
         ]
