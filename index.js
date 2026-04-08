@@ -1,611 +1,631 @@
-const fs = require('fs');
-const qrcode = require('qrcode-terminal');
-const { Client, LocalAuth } = require('whatsapp-web.js');
-const { prompt } = require('enquirer');
+'use strict';
 
-// Configuración de reintentos
-const MAX_RETRIES = 3;
-const RETRY_DELAY_MS = 5000;
+/**
+ * ╔══════════════════════════════════════════════════════════════════╗
+ * ║   EXTRACTOR DE COMPROBANTES  —  WhatsApp → Word                ║
+ * ║                                                                 ║
+ * ║   INSTALACIÓN:                                                  ║
+ * ║     npm install @whiskeysockets/baileys enquirer docx pino      ║
+ * ║                                                                 ║
+ * ║   USO:  node index.js                                           ║
+ * ╚══════════════════════════════════════════════════════════════════╝
+ */
+
+const fs     = require('fs');
+const QRCode = require('qrcode');
+const { prompt } = require('enquirer');
+const pino = require('pino');
+
 const {
-  Document,
-  Packer,
-  Paragraph,
-  TextRun,
-  ImageRun,
-  Table,
-  TableRow,
-  TableCell,
-  WidthType,
-  BorderStyle,
-  VerticalAlign,
-  AlignmentType,
-  Header
+  default: makeWASocket,
+  useMultiFileAuthState,
+  downloadMediaMessage,
+  fetchLatestBaileysVersion,
+  DisconnectReason,
+  Browsers,
+} = require('@whiskeysockets/baileys');
+
+const {
+  Document, Packer, Paragraph, TextRun, ImageRun,
+  Table, TableRow, TableCell,
+  WidthType, BorderStyle, VerticalAlign, AlignmentType, Header,
 } = require('docx');
 
-const GROUP_NAME = 'TRANSFERENCIAS RED POSTAL POBLADO';
+// ─── Config ─────────────────────────────────────────────────────────────────
+const GROUP_NAME  = 'TRANSFERENCIAS RED POSTAL POBLADO';
+const AUTH_FOLDER = './baileys_auth';
+const CACHE_FILE  = './group_cache.json';
+const OUTPUT_FILE = 'Comprobantes_Descargados.docx';
 
-// Función auxiliar para esperar
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// Reemplaza makeInMemoryStore: guardamos mensajes en un Map simple
+const msgStore = new Map(); // `${jid}:${id}` → msg
+
+// ════════════════════════════════════════════════════════════════════════════
+// 1. PREGUNTAR FECHAS
+// ════════════════════════════════════════════════════════════════════════════
+async function askDateRange() {
+  console.log('\n══════════════════════════════════════════════════════');
+  console.log('  CONFIGURACIÓN DE FECHAS  (máximo 1 semana)');
+  console.log('══════════════════════════════════════════════════════');
+  console.log('  Formato fecha: YYYY-MM-DD   Hora: HH:MM\n');
+
+  const answers = await prompt([
+    { type: 'input', name: 'startDate', message: 'Fecha INICIO (YYYY-MM-DD) [Enter = AYER]:' },
+    { type: 'input', name: 'startTime', message: 'Hora  INICIO (HH:MM)      [Enter = 08:30]:' },
+    { type: 'input', name: 'endDate',   message: 'Fecha FIN    (YYYY-MM-DD) [Enter = HOY ]:' },
+    { type: 'input', name: 'endTime',   message: 'Hora  FIN    (HH:MM)      [Enter = 23:59]:' },
+  ]);
+
+  const parseTime = (str, defH, defM) => {
+    if (!str?.trim()) return [defH, defM];
+    const [h, m] = str.trim().split(':').map(Number);
+    return [
+      !isNaN(h) && h >= 0 && h <= 23 ? h : defH,
+      !isNaN(m) && m >= 0 && m <= 59 ? m : defM,
+    ];
+  };
+
+  const buildDate = (dateStr, timeStr, offsetDays, defH, defM, sec, ms) => {
+    const [h, m] = parseTime(timeStr, defH, defM);
+    if (dateStr?.trim()) {
+      const [y, mo, d] = dateStr.trim().split('-').map(Number);
+      return new Date(y, mo - 1, d, h, m, sec, ms);
+    }
+    const now = new Date();
+    return new Date(now.getFullYear(), now.getMonth(), now.getDate() + offsetDays, h, m, sec, ms);
+  };
+
+  const startDate = buildDate(answers.startDate, answers.startTime, -1,  8, 30,  0,   0);
+  const endDate   = buildDate(answers.endDate,   answers.endTime,    0, 23, 59, 59, 999);
+
+  console.log(`\n  📅 INICIO : ${startDate.toLocaleString('es-CO')}`);
+  console.log(`  📅 FIN    : ${endDate.toLocaleString('es-CO')}\n`);
+
+  if (endDate <= startDate) {
+    console.error('❌ La fecha de fin debe ser posterior a la de inicio.');
+    process.exit(1);
+  }
+
+  return { startDate, endDate };
 }
 
-// Función para crear el cliente con la configuración correcta
-function createClient() {
-  return new Client({
-    authStrategy: new LocalAuth({ dataPath: './.wwebjs_auth' }),
-    webVersionCache: {
-      type: 'remote',
-      remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.2412.54.html',
+// ════════════════════════════════════════════════════════════════════════════
+// 2. CREAR SOCKET
+// ════════════════════════════════════════════════════════════════════════════
+async function createSocket() {
+  const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
+  const { version, isLatest } = await fetchLatestBaileysVersion();
+  console.log(`  WA v${version.join('.')} ${isLatest ? '(última)' : '(desactualizada)'}\n`);
+
+  const logger = pino({ level: 'silent' });
+
+  const sock = makeWASocket({
+    version,
+    logger,
+    auth: state,
+    browser: Browsers.ubuntu('Chrome'),
+    syncFullHistory: true,
+    markOnlineOnConnect: false,
+    // getMessage usa nuestro store manual
+    getMessage: async key => {
+      const stored = msgStore.get(`${key.remoteJid}:${key.id}`);
+      return stored?.message ?? undefined;
     },
-    puppeteer: {
-      headless: true,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-accelerated-2d-canvas',
-        '--no-first-run',
-        '--disable-gpu',
-        '--disable-extensions',
-        '--disable-background-networking',
-        '--disable-background-timer-throttling',
-        '--disable-backgrounding-occluded-windows',
-        '--disable-breakpad',
-        '--disable-component-extensions-with-background-pages',
-        '--disable-features=TranslateUI',
-        '--disable-ipc-flooding-protection',
-        '--disable-renderer-backgrounding',
-        '--enable-features=NetworkService,NetworkServiceInProcess',
-        '--force-color-profile=srgb',
-        '--metrics-recording-only'
-      ],
-      protocolTimeout: 600000,
-      timeout: 300000
+  });
+
+  sock.ev.on('creds.update', saveCreds);
+
+  // Guardar mensajes en el store manual
+  sock.ev.on('messages.upsert', ({ messages }) => {
+    for (const msg of messages) {
+      if (msg.key?.remoteJid && msg.key?.id) {
+        msgStore.set(`${msg.key.remoteJid}:${msg.key.id}`, msg);
+      }
     }
+  });
+
+  sock.ev.on('messaging-history.set', ({ messages }) => {
+    for (const msg of messages) {
+      if (msg.key?.remoteJid && msg.key?.id) {
+        msgStore.set(`${msg.key.remoteJid}:${msg.key.id}`, msg);
+      }
+    }
+  });
+
+  return sock;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// 3. ESPERAR CONEXIÓN — devuelve 'open' | 'restart' | 'loggedOut'
+// ════════════════════════════════════════════════════════════════════════════
+function waitForOpen(sock) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error('Timeout: no se pudo conectar en 3 minutos.')),
+      180_000
+    );
+
+    sock.ev.on('connection.update', ({ connection, lastDisconnect, qr }) => {
+      if (qr) {
+        console.log('\n══════════════════════════════════════════════════════');
+        console.log('  ESCANEA ESTE CÓDIGO QR CON WHATSAPP');
+        console.log('══════════════════════════════════════════════════════\n');
+        QRCode.toString(qr, { type: 'terminal', small: true }, (err, url) => {
+          if (!err) console.log(url);
+        });
+      }
+      if (connection === 'open') {
+        clearTimeout(timer);
+        console.log('✅ Conectado a WhatsApp.\n');
+        resolve('open');
+      }
+      if (connection === 'close') {
+        clearTimeout(timer);
+        const code = lastDisconnect?.error?.output?.statusCode;
+        if (code === DisconnectReason.loggedOut) {
+          console.log('\n⚠  Sesión cerrada. Elimina "baileys_auth" y reescanea el QR.\n');
+          fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
+          resolve('loggedOut');
+          return;
+        }
+        // 515 = restartRequired: WhatsApp pide reconectar
+        if (code === 515 || code === DisconnectReason.restartRequired) {
+          console.log('⚠  WhatsApp pidió reconexión (515). Reintentando...\n');
+          resolve('restart');
+          return;
+        }
+        console.log(`⚠  Conexión cerrada (código ${code}). Reintentando...\n`);
+        resolve('restart');
+      }
+    });
   });
 }
 
-async function initializeClientWithRetry(client, startDate, endDate, attempt = 1) {
-  return new Promise((resolve, reject) => {
-    let initialized = false;
-    let timeoutId;
-    
-    const cleanup = () => {
-      if (timeoutId) clearTimeout(timeoutId);
-      client.removeAllListeners('qr');
-      client.removeAllListeners('ready');
-      client.removeAllListeners('auth_failure');
-      client.removeAllListeners('disconnected');
+// ════════════════════════════════════════════════════════════════════════════
+// 4. ENCONTRAR JID DEL GRUPO
+// ════════════════════════════════════════════════════════════════════════════
+async function findGroupJid(sock) {
+  if (fs.existsSync(CACHE_FILE)) {
+    try {
+      const { groupJid, groupName } = JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8'));
+      console.log(`📦 Grupo en caché: ${groupName}`);
+      return groupJid;
+    } catch {
+      fs.unlinkSync(CACHE_FILE);
+    }
+  }
+
+  console.log('🔍 Buscando grupo...');
+  let groups;
+  try {
+    groups = await sock.groupFetchAllParticipating();
+  } catch (err) {
+    throw new Error(`No se pudo obtener grupos: ${err.message}`);
+  }
+
+  const entries = Object.values(groups);
+  const match   = entries.find(g =>
+    g.subject?.toUpperCase().includes(GROUP_NAME.toUpperCase())
+  );
+
+  if (!match) {
+    console.log('\n❌ Grupo no encontrado. Grupos disponibles:');
+    entries.forEach(g => console.log(`   • ${g.subject}`));
+    console.log('\n💡 Ajusta GROUP_NAME en el código.');
+    throw new Error('Grupo no encontrado.');
+  }
+
+  fs.writeFileSync(CACHE_FILE, JSON.stringify({ groupJid: match.id, groupName: match.subject }));
+  console.log(`✅ Grupo: ${match.subject}\n`);
+  return match.id;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// 5. RECOLECTAR MENSAJES DEL GRUPO EN EL RANGO DE FECHAS
+// ════════════════════════════════════════════════════════════════════════════
+
+/** Convierte messageTimestamp (puede ser Long, string o number) a Unix seconds */
+function toUnix(ts) {
+  if (ts == null) return 0;
+  // Baileys usa Long objects ({ low, high, unsigned })
+  if (typeof ts === 'object' && ts.low !== undefined) {
+    return Number(ts.toNumber ? ts.toNumber() : ts.low);
+  }
+  return Number(ts);
+}
+
+function collectMessages(sock, groupJid, startTs, endTs) {
+  return new Promise(resolve => {
+    const collected = new Map();
+    let idleTimer;
+    let globalTimer;
+    let finished = false;
+    let historyChunks = 0;
+    let totalMsgsReceived = 0;
+    let totalGroupMsgs = 0;
+
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(idleTimer);
+      clearTimeout(globalTimer);
+      sock.ev.off('messaging-history.set', onHistory);
+      sock.ev.off('messages.upsert',       onUpsert);
+
+      // ── Fallback: también revisar el msgStore completo ──
+      let fromStore = 0;
+      for (const [key, msg] of msgStore.entries()) {
+        if (!msg.key?.remoteJid || msg.key.remoteJid !== groupJid) continue;
+        const ts = toUnix(msg.messageTimestamp);
+        if (ts < startTs || ts > endTs) continue;
+        if (!isMedia(msg)) continue;
+        if (!collected.has(msg.key.id)) {
+          collected.set(msg.key.id, msg);
+          fromStore++;
+        }
+      }
+      if (fromStore > 0) {
+        console.log(`  📦 ${fromStore} comprobantes adicionales encontrados en caché local.`);
+      }
+
+      console.log(`\n  📈 Debug: ${historyChunks} chunks de historial, ${totalMsgsReceived} mensajes totales recibidos, ${totalGroupMsgs} del grupo`);
+      resolve([...collected.values()]);
     };
 
-    client.on('qr', (qr) => {
-      console.log('\n======================================================');
-      console.log(' POR FAVOR ESCANEA EL SIGUIENTE CÓDIGO QR CON WHATSAPP');
-      console.log('======================================================\n');
-      qrcode.generate(qr, { small: true });
-    });
+    const resetIdle = () => {
+      clearTimeout(idleTimer);
+      // Esperar 30s en lugar de 15s para dar tiempo a la sincronización
+      idleTimer = setTimeout(() => {
+        process.stdout.write('\n  ⏱ Sin más mensajes entrantes. Continuando...\n');
+        finish();
+      }, 30_000);
+    };
 
-    client.on('auth_failure', (msg) => {
-      console.error('❌ Error de autenticación:', msg);
-      cleanup();
-      reject(new Error('Authentication failed'));
-    });
+    const isMedia = msg =>
+      !!msg.message?.imageMessage || !!msg.message?.documentMessage;
 
-    client.on('disconnected', (reason) => {
-      console.log('⚠ Cliente desconectado:', reason);
-      if (!initialized) {
-        cleanup();
-        reject(new Error(`Disconnected: ${reason}`));
+    const addMsg = (msg, source) => {
+      totalMsgsReceived++;
+      if (!msg.key?.remoteJid) return;
+      if (msg.key.remoteJid !== groupJid) return;
+      totalGroupMsgs++;
+
+      const ts = toUnix(msg.messageTimestamp);
+
+      // Debug: mostrar primer mensaje del grupo para verificar timestamps
+      if (totalGroupMsgs <= 3) {
+        const date = new Date(ts * 1000);
+        console.log(`  🔎 [${source}] Mensaje del grupo: ts=${ts} (${date.toLocaleString('es-CO')}), tipo=${
+          msg.message?.imageMessage ? 'imagen' :
+          msg.message?.documentMessage ? 'documento' :
+          msg.message?.conversation ? 'texto' :
+          msg.message?.extendedTextMessage ? 'texto ext.' :
+          Object.keys(msg.message || {}).join(',') || 'vacío'
+        }`);
       }
-    });
 
-    client.on('ready', async () => {
-      initialized = true;
-      cleanup();
-      console.log('✅ Cliente de WhatsApp listo y conectado.');
-      try {
-        await processGroupMessages(client, startDate, endDate);
-        resolve();
-      } catch (error) {
-        reject(error);
+      if (ts < startTs || ts > endTs) return;
+      if (!isMedia(msg)) return;
+      if (!collected.has(msg.key.id)) {
+        collected.set(msg.key.id, msg);
+        process.stdout.write(`\r  📨 Comprobantes encontrados: ${collected.size}   `);
       }
-    });
+    };
 
-    // Timeout de seguridad para la inicialización (3 minutos)
-    timeoutId = setTimeout(() => {
-      if (!initialized) {
-        cleanup();
-        reject(new Error('Timeout durante la inicialización'));
+    const onHistory = ({ messages: msgs, isLatest }) => {
+      historyChunks++;
+      console.log(`  📥 Chunk de historial #${historyChunks}: ${msgs.length} mensajes (isLatest=${isLatest})`);
+      msgs.forEach(m => addMsg(m, 'history'));
+      resetIdle();
+      if (isLatest) {
+        process.stdout.write('\n  ✅ Historial sincronizado.\n');
+        clearTimeout(idleTimer);
+        // Esperar 8s después de "isLatest" por si llegan más chunks
+        idleTimer = setTimeout(finish, 8_000);
       }
-    }, 180000);
+    };
 
-    console.log(`🔄 Iniciando cliente de WhatsApp (intento ${attempt}/${MAX_RETRIES})...`);
-    
-    client.initialize().catch(err => {
-      cleanup();
-      reject(err);
-    });
+    const onUpsert = ({ messages: msgs, type }) => {
+      // Procesar TODOS los tipos: 'notify' (tiempo real) y 'append' (históricos)
+      console.log(`  📬 Upsert: ${msgs.length} mensajes, type=${type}`);
+      msgs.forEach(m => addMsg(m, `upsert-${type}`));
+      if (type === 'append') resetIdle();
+    };
+
+    sock.ev.on('messaging-history.set', onHistory);
+    sock.ev.on('messages.upsert',       onUpsert);
+
+    // Tiempo máximo: 3 minutos (antes eran 2)
+    globalTimer = setTimeout(() => {
+      process.stdout.write('\n  ⏱ Tiempo máximo alcanzado.\n');
+      finish();
+    }, 180_000);
+
+    resetIdle();
   });
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// FUNCIÓN PRINCIPAL - Parseo de fechas CORREGIDO
-// ─────────────────────────────────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
+// 6. DESCARGAR MEDIA
+// ════════════════════════════════════════════════════════════════════════════
+async function downloadImage(sock, msg) {
+  try {
+    const buffer = await downloadMediaMessage(
+      msg,
+      'buffer',
+      {},
+      { logger: pino({ level: 'silent' }), reuploadRequest: sock.updateMediaMessage }
+    );
+    return buffer;
+  } catch (err) {
+    process.stdout.write(`\n  ⚠ No se pudo descargar: ${err.message}\n`);
+    return null;
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// 7. NOMBRE DEL REMITENTE
+// ════════════════════════════════════════════════════════════════════════════
+function getSenderName(msg, contacts) {
+  const jid    = msg.key.participant ?? msg.key.remoteJid;
+  const number = jid.split('@')[0];
+  const c      = contacts[jid];
+  return c?.name || c?.notify || number;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// 8. MAIN
+// ════════════════════════════════════════════════════════════════════════════
 async function main() {
-  console.log('\n======================================================');
-  console.log(' CONFIGURACIÓN DE FECHAS DE DESCARGA');
-  console.log('======================================================');
-  console.log('Ingresa la fecha en formato YYYY-MM-DD (ej: 2026-03-12).');
-  console.log('Si dejas en blanco, usará AYER como inicio y HOY como fin.\n');
+  const { startDate, endDate } = await askDateRange();
+  const startTs = Math.floor(startDate.getTime() / 1000);
+  const endTs   = Math.floor(endDate.getTime()   / 1000);
 
-  const questions = [
-    {
-      type: 'input',
-      name: 'startDate',
-      message: 'Fecha de INICIO (YYYY-MM-DD) [Enter = AYER]:'
-    },
-    {
-      type: 'input',
-      name: 'startTime',
-      message: 'Hora de INICIO (HH:MM) [Enter = 08:30]:'
-    },
-    {
-      type: 'input',
-      name: 'endDate',
-      message: 'Fecha de FIN   (YYYY-MM-DD) [Enter = HOY]:'
-    },
-    {
-      type: 'input',
-      name: 'endTime',
-      message: 'Hora de FIN    (HH:MM)      [Enter = 23:59]:'
-    }
-  ];
+  // ── Conexión con reintentos automáticos ───────────────────────────────────
+  let sock;
+  let contacts = {};
+  const MAX_RETRIES = 5;
 
-  const answers = await prompt(questions);
-
-  // ── Parsear hora de inicio (por defecto 08:30) ──────────────────────────
-  let startHour = 8;
-  let startMinute = 30;
-  if (answers.startTime && answers.startTime.trim() !== '') {
-    const timeParts = answers.startTime.trim().split(':');
-    // Usamos exactamente lo que el usuario escribe, sin sumar nada
-    startHour   = parseInt(timeParts[0], 10);
-    startMinute = parseInt(timeParts[1], 10);
-    // Validación básica
-    if (isNaN(startHour) || startHour < 0 || startHour > 23)   startHour   = 8;
-    if (isNaN(startMinute) || startMinute < 0 || startMinute > 59) startMinute = 30;
-  }
-
-  // ── Fecha de INICIO ──────────────────────────────────────────────────────
-  // Importante: construimos la fecha manualmente para evitar que setDate()
-  // interactúe con los meses de forma inesperada cuando mezclamos setFullYear/setMonth/setDate.
-  let startDate;
-  if (answers.startDate && answers.startDate.trim() !== '') {
-    const parts = answers.startDate.trim().split('-');
-    const year  = parseInt(parts[0], 10);
-    const month = parseInt(parts[1], 10) - 1; // 0-indexed
-    const day   = parseInt(parts[2], 10);
-    startDate = new Date(year, month, day, startHour, startMinute, 0, 0);
-  } else {
-    // AYER a la hora indicada
-    const now = new Date();
-    startDate = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1, startHour, startMinute, 0, 0);
-  }
-
-  // ── Parsear hora de FIN (por defecto 23:59) ──────────────────────────
-  let endHour = 23;
-  let endMinute = 59;
-  if (answers.endTime && answers.endTime.trim() !== '') {
-    const timeParts = answers.endTime.trim().split(':');
-    endHour   = parseInt(timeParts[0], 10);
-    endMinute = parseInt(timeParts[1], 10);
-    if (isNaN(endHour)   || endHour   < 0 || endHour   > 23) endHour   = 23;
-    if (isNaN(endMinute) || endMinute < 0 || endMinute > 59) endMinute = 59;
-  }
-
-  // ── Fecha de FIN ───────────────────────────────────────────────
-  let endDate;
-  if (answers.endDate && answers.endDate.trim() !== '') {
-    const parts = answers.endDate.trim().split('-');
-    const year  = parseInt(parts[0], 10);
-    const month = parseInt(parts[1], 10) - 1;
-    const day   = parseInt(parts[2], 10);
-    endDate = new Date(year, month, day, endHour, endMinute, 59, 999);
-  } else {
-    // HOY a la hora de fin indicada
-    const now = new Date();
-    endDate = new Date(now.getFullYear(), now.getMonth(), now.getDate(), endHour, endMinute, 59, 999);
-  }
-
-  console.log(`\n📅 Rango seleccionado:`);
-  console.log(`   INICIO: ${startDate.toLocaleString('es-CO')}`);
-  console.log(`   FIN:    ${endDate.toLocaleString('es-CO')}\n`);
-
-  let lastError;
-  
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-    let client;
-    try {
-      client = createClient();
-      await initializeClientWithRetry(client, startDate, endDate, attempt);
-      console.log('▶ Proceso finalizado exitosamente.');
-      process.exit(0);
-    } catch (error) {
-      lastError = error;
-      const isContextDestroyed = error.message && (
-        error.message.includes('Execution context was destroyed') ||
-        error.message.includes('Protocol error') ||
-        error.message.includes('Target closed') ||
-        error.message.includes('Session closed')
-      );
-      
-      const isFrameDetached = error.message && (
-        error.message.includes('Navigating frame was detached') ||
-        error.message.includes('frame was detached') ||
-        error.message.includes('frame detached')
-      );
-      
-      const isRuntimeTimeout = error.message && (
-        error.message.includes('runtime.callfuncuint timed out') ||
-        error.message.includes('protocolTimeout') ||
-        error.message.includes('timed out')
-      );
-      
-      console.error(`\n❌ Error en intento ${attempt}/${MAX_RETRIES}:`, error.message);
-      
-      if (client) {
-        try {
-          await client.destroy();
-        } catch (destroyErr) {
-          // Ignorar errores al destruir
+    console.log(`🔄 Conectando con WhatsApp (intento ${attempt}/${MAX_RETRIES})...\n`);
+    contacts = {};
+    sock = await createSocket();
+
+    sock.ev.on('contacts.set',    ({ contacts: list }) => list.forEach(c => { contacts[c.id] = c; }));
+    sock.ev.on('contacts.upsert', list               => list.forEach(c => { contacts[c.id] = c; }));
+
+    const result = await waitForOpen(sock);
+
+    if (result === 'open')      break;
+    if (result === 'loggedOut') process.exit(1);
+
+    // restart / retry: destruir socket y volver a intentar
+    try { await sock.end(); } catch { /* ignore */ }
+    if (attempt === MAX_RETRIES) {
+      console.error('❌ No se pudo conectar después de varios intentos.');
+      process.exit(1);
+    }
+    await sleep(3_000);
+  }
+
+  const groupJid = await findGroupJid(sock);
+
+  console.log('⏳ Esperando sincronización de historial...');
+  console.log('   (30-90 s la primera vez; más rápido en ejecuciones siguientes)');
+  console.log(`   🔎 Rango de búsqueda: startTs=${startTs} endTs=${endTs}`);
+  console.log(`   🔎 Inicio: ${new Date(startTs * 1000).toLocaleString('es-CO')}`);
+  console.log(`   🔎 Fin:    ${new Date(endTs * 1000).toLocaleString('es-CO')}`);
+  console.log(`   🔎 Mensajes en store antes de recolectar: ${msgStore.size}\n`);
+
+  // Manejar cierre de conexión durante la recolección
+  let connectionLost = false;
+  const onClose = ({ connection }) => {
+    if (connection === 'close') {
+      connectionLost = true;
+      console.log('\n  ⚠ Conexión cerrada durante sincronización, procesando lo recolectado...');
+    }
+  };
+  sock.ev.on('connection.update', onClose);
+
+  const rawMsgs = await collectMessages(sock, groupJid, startTs, endTs);
+
+  sock.ev.off('connection.update', onClose);
+
+  console.log(`\n📊 Total comprobantes en el rango: ${rawMsgs.length}`);
+  console.log(`📊 Mensajes totales en store: ${msgStore.size}`);
+
+  if (rawMsgs.length === 0) {
+    // Intentar buscar directamente en el store como último recurso
+    console.log('\n🔄 Verificando store completo por si los mensajes se etiquetaron diferente...');
+    let storeGroupMsgs = 0;
+    let storeGroupMedia = 0;
+    for (const [, msg] of msgStore.entries()) {
+      if (msg.key?.remoteJid === groupJid) {
+        storeGroupMsgs++;
+        const ts = toUnix(msg.messageTimestamp);
+        const hasImage = !!msg.message?.imageMessage;
+        const hasDoc = !!msg.message?.documentMessage;
+        if (hasImage || hasDoc) storeGroupMedia++;
+        // Mostrar algunos mensajes del grupo para diagnóstico
+        if (storeGroupMsgs <= 5) {
+          const date = new Date(ts * 1000);
+          const types = Object.keys(msg.message || {}).join(', ');
+          console.log(`   Msg ${storeGroupMsgs}: ts=${ts} (${date.toLocaleString('es-CO')}) tipos=[${types}]`);
         }
       }
-      
-      if (attempt < MAX_RETRIES) {
-        if (isContextDestroyed) {
-          console.log(`\n⚠ Se detectó error de contexto destruido.`);
-          console.log(`🔄 Reintentando en ${RETRY_DELAY_MS / 1000} segundos...\n`);
-        } else if (isFrameDetached) {
-          console.log(`\n⚠ Se detectó error "frame detached" (común en Windows).`);
-          console.log(`🔄 Reintentando en ${RETRY_DELAY_MS / 1000} segundos...\n`);
-        } else if (isRuntimeTimeout) {
-          console.log(`\n⚠ Se detectó error de timeout.`);
-          console.log(`🔄 Reintentando en ${RETRY_DELAY_MS / 1000} segundos...\n`);
-        } else {
-          console.log(`🔄 Reintentando en ${RETRY_DELAY_MS / 1000} segundos...\n`);
-        }
-        await sleep(RETRY_DELAY_MS);
-      }
     }
-  }
-  
-  console.error('\n❌ Se agotaron todos los intentos. Error final:', lastError?.message);
-  console.log('\n💡 Sugerencias para resolver el problema:');
-  console.log('   1. Elimina la carpeta .wwebjs_auth y vuelve a escanear el QR');
-  console.log('   2. Asegúrate de tener una conexión a internet estable');
-  console.log('   3. Intenta cerrar otras instancias de WhatsApp Web');
-  console.log('   4. Reinicia la aplicación');
-  console.log('   5. Usa Node.js versión 18.x o 20.x (versiones LTS recomendadas)\n');
-  process.exit(1);
-}
+    console.log(`   Total mensajes del grupo en store: ${storeGroupMsgs}`);
+    console.log(`   Mensajes con media en store:       ${storeGroupMedia}`);
 
-// ─────────────────────────────────────────────────────────────────────────────
-// BÚSQUEDA DE GRUPO — Con caché para acelerar ejecuciones a partir de la 2ª
-// ─────────────────────────────────────────────────────────────────────────────
-async function processGroupMessages(client, startDate, endDate) {
-  const cacheFile = './group_cache.json';
-  let group = null;
-
-  // 1) Intentar cargar desde caché (mucho más rápido que getChats())
-  if (fs.existsSync(cacheFile)) {
-    console.log('📦 Cargando grupo desde caché...');
-    try {
-      const cachedData = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
-      group = await Promise.race([
-        client.getChatById(cachedData.groupId),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout de caché')), 8000))
-      ]);
-      console.log(`✅ Grupo cargado desde caché: ${group.name}`);
-    } catch (err) {
-      console.log('⚠ El caché ya no sirve (¿cambiaste de cuenta?). Buscando de nuevo...');
-      fs.unlinkSync(cacheFile);
-      group = null;
-    }
+    console.log('\n⚠  No se encontraron imágenes en el rango seleccionado.');
+    console.log('   Posibles causas:');
+    console.log('   1. El historial no se sincronizó completamente.');
+    console.log('   2. Las fechas seleccionadas no coinciden con los mensajes.');
+    console.log('   → Intenta borrar la carpeta "baileys_auth" y reescanea el QR.\n');
+    try { await sock.end(); } catch { /* ignore */ }
+    process.exit(0);
   }
 
-  // 2) Si no hay caché, buscar en todos los chats (más lento, solo la primera vez)
-  if (!group) {
-    console.log(`🔍 Buscando el grupo: "${GROUP_NAME}"`);
-    console.log('⏳ Cargando todos los chats (puede tardar varios minutos la primera vez)...\n');
-    
-    try {
-      const chats = await client.getChats();
-      console.log(`✅ Se cargaron ${chats.length} chats.`);
-      
-      const matchedGroup = chats.find(c =>
-        c.isGroup && c.name && c.name.toUpperCase().includes(GROUP_NAME.toUpperCase())
-      );
-      
-      if (matchedGroup) {
-        group = matchedGroup;
-        console.log(`✅ Grupo localizado: ${group.name}`);
-        fs.writeFileSync(cacheFile, JSON.stringify({ groupId: group.id._serialized }));
-        console.log('💾 ID del grupo guardado en caché para futuras búsquedas instantáneas.');
-      } else {
-        const availableGroups = chats.filter(c => c.isGroup && c.name);
-        console.log(`\n❌ No se encontró el grupo "${GROUP_NAME}".`);
-        console.log(`\n📋 Grupos disponibles (${availableGroups.length}):`);
-        availableGroups.slice(0, 20).forEach((g, i) => {
-          console.log(`   ${i + 1}. ${g.name}`);
-        });
-        if (availableGroups.length > 20) {
-          console.log(`   ... y ${availableGroups.length - 20} grupos más.`);
-        }
-        console.log(`\n💡 Verifica que el nombre del grupo sea correcto y modifica GROUP_NAME en el código.`);
-        return;
-      }
-    } catch (e) {
-      console.error('❌ Error al cargar los chats:', e.message);
-      return;
-    }
-  }
-
-  const startTimestamp = Math.floor(startDate.getTime() / 1000);
-  const endTimestamp   = Math.floor(endDate.getTime()   / 1000);
-
-  console.log('\nBuscando mensajes en el rango de fechas...');
-
-  const messages = await group.fetchMessages({ limit: 1000 });
-  
-  const validMessages = messages.filter(msg => {
-    return msg.timestamp >= startTimestamp &&
-           msg.timestamp <= endTimestamp &&
-           msg.hasMedia &&
-           (msg.type === 'image' || msg.type === 'document');
-  });
-
-  console.log(`Se encontraron ${validMessages.length} imágenes en el rango de fechas.`);
-
-  if (validMessages.length === 0) {
-    console.log('⚠ No hay imágenes para descargar en ese rango.');
-    return;
-  }
-
+  console.log('\n⬇  Descargando imágenes...\n');
   const receipts = [];
 
-  for (let i = 0; i < validMessages.length; i++) {
-    const msg = validMessages[i];
-    console.log(`\nProcesando imagen ${i + 1} de ${validMessages.length}...`);
-    
-    try {
-      const media = await msg.downloadMedia();
-      if (!media || !media.mimetype.includes('image')) {
-        console.log(`  ⚠ El mensaje ${i+1} no es una imagen compatible.`);
-        continue;
-      }
+  for (let i = 0; i < rawMsgs.length; i++) {
+    const msg = rawMsgs[i];
+    process.stdout.write(`\r  [${i + 1}/${rawMsgs.length}] Descargando...`);
 
-      const contact = await msg.getContact();
-      const senderName = contact.name || contact.pushname || contact.number || 'Desconocido';
-      
-      const dateObj = new Date(msg.timestamp * 1000);
-      const formattedDate = dateObj.toLocaleString('es-CO');
+    const buffer = await downloadImage(sock, msg);
+    if (!buffer) continue;
 
-      const imageBuffer = Buffer.from(media.data, 'base64');
-      
-      console.log(`  👤 Mensajero: ${senderName} | 📅 Fecha: ${formattedDate}`);
+    const mimetype =
+      msg.message?.imageMessage?.mimetype ??
+      msg.message?.documentMessage?.mimetype ?? '';
 
-      receipts.push({
-        imageBuffer,
-        senderName,
-        date: formattedDate,
-        mimetype: media.mimetype
-      });
-
-    } catch (err) {
-      console.error(`  ❌ Error al procesar el mensaje ${i+1}:`, err.message);
+    if (!mimetype.startsWith('image/')) {
+      process.stdout.write(`\n  ⚠ Omitido — no es imagen (${mimetype || 'sin tipo'})\n`);
+      continue;
     }
+
+    receipts.push({
+      imageBuffer: buffer,
+      senderName:  getSenderName(msg, contacts),
+      date:        new Date(toUnix(msg.messageTimestamp) * 1000).toLocaleString('es-CO'),
+    });
+  }
+
+  console.log(`\n\n✅ Imágenes válidas: ${receipts.length}`);
+
+  try { await sock.end(); } catch { /* ignore */ }
+
+  if (receipts.length === 0) {
+    console.log('⚠  Nada que exportar.\n');
+    process.exit(0);
   }
 
   await createWordDocument(receipts);
+  process.exit(0);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// CREACIÓN DEL DOCUMENTO WORD
-// Reglas:
-//   • Un solo mensajero por hoja
-//   • Máximo 6 comprobantes por hoja (3 columnas × 2 filas)
-//   • Orientación VERTICAL (portrait)
-//   • Cada nuevo mensajero comienza en una nueva hoja
-//   • El nombre del mensajero se muestra claramente en el header de cada hoja
-// ─────────────────────────────────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
+// 9. GENERAR DOCUMENTO WORD
+// ════════════════════════════════════════════════════════════════════════════
 async function createWordDocument(receipts) {
-  // 1) Agrupar comprobantes por mensajero, manteniendo el orden de llegada
-  const senderOrder = [];
-  const groupedReceipts = {};
-  receipts.forEach(r => {
-    if (!groupedReceipts[r.senderName]) {
-      groupedReceipts[r.senderName] = [];
-      senderOrder.push(r.senderName);
-    }
-    groupedReceipts[r.senderName].push(r);
-  });
+  console.log('\n📄 Generando documento Word...');
+
+  const order   = [];
+  const grouped = {};
+  for (const r of receipts) {
+    if (!grouped[r.senderName]) { grouped[r.senderName] = []; order.push(r.senderName); }
+    grouped[r.senderName].push(r);
+  }
 
   const sections = [];
 
-  // 2) Por cada mensajero, crear tantas secciones (hojas) como sean necesarias
-  for (const senderName of senderOrder) {
-    const senderReceipts = groupedReceipts[senderName];
-    const totalPages = Math.ceil(senderReceipts.length / 6);
+  for (const sender of order) {
+    const list  = grouped[sender];
+    const pages = Math.ceil(list.length / 6);
 
-    for (let pageIdx = 0; pageIdx < totalPages; pageIdx++) {
-      const chunk = senderReceipts.slice(pageIdx * 6, (pageIdx + 1) * 6);
-      const isExtraPage = pageIdx > 0;
+    for (let p = 0; p < pages; p++) {
+      const chunk   = list.slice(p * 6, (p + 1) * 6);
+      const isExtra = p > 0;
 
-      // ── Header de página: nombre del mensajero bien visible ──────────────
-      const pageHeader = new Header({
+      const header = new Header({
         children: [
           new Paragraph({
             children: [
+              new TextRun({ text: 'MENSAJERO: ', bold: true, size: 36, color: '1a1a1a' }),
               new TextRun({
-                text: '📋  MENSAJERO: ',
-                bold: true,
-                size: 36,     // 18pt
-                color: '1a1a1a'
-              }),
-              new TextRun({
-                text: `${senderName.toUpperCase()}${isExtraPage ? '  (Continuación)' : ''}`,
-                bold: true,
-                size: 36,
-                color: '003399'
+                text: `${sender.toUpperCase()}${isExtra ? '  (Continuación)' : ''}`,
+                bold: true, size: 36, color: '003399',
               }),
             ],
             alignment: AlignmentType.CENTER,
             spacing: { before: 80, after: 120 },
-            border: {
-              bottom: { style: BorderStyle.THICK, size: 8, color: '003399' }
-            }
+            border: { bottom: { style: BorderStyle.THICK, size: 8, color: '003399' } },
           }),
           new Paragraph({
-            children: [
-              new TextRun({
-                text: `Hoja ${pageIdx + 1} de ${totalPages}   |   Total comprobantes: ${senderReceipts.length}   |   Total a verificar: $ ________________________`,
-                size: 22,
-                color: '555555'
-              })
-            ],
+            children: [new TextRun({
+              text: `Hoja ${p + 1} / ${pages}   |   Total comprobantes: ${list.length}   |   Valor a verificar: $________________________`,
+              size: 22, color: '555555',
+            })],
             alignment: AlignmentType.CENTER,
-            spacing: { before: 60, after: 0 }
-          })
-        ]
+            spacing: { before: 60, after: 0 },
+          }),
+        ],
       });
 
-      // ── Tabla: 3 columnas × 2 filas = 6 comprobantes ────────────────────
       const rows = [];
-      for (let rIndex = 0; rIndex < chunk.length; rIndex += 3) {
+      for (let ri = 0; ri < chunk.length; ri += 3) {
         const cells = [];
-
         for (let col = 0; col < 3; col++) {
-          const idx = rIndex + col;
-          if (idx < chunk.length) {
-            cells.push(createReceiptCell(chunk[idx]));
-          } else {
-            // Celda vacía para completar la fila
-            cells.push(new TableCell({
-              children: [new Paragraph({ text: '' })],
-              width: { size: 3333, type: WidthType.DXA },
-              borders: {
-                top:    { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' },
-                bottom: { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' },
-                left:   { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' },
-                right:  { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' },
-              }
-            }));
-          }
+          const idx = ri + col;
+          cells.push(idx < chunk.length ? receiptCell(chunk[idx]) : emptyCell());
         }
-
-        // Altura de fila: ~6000 twips ≈ 10.6 cm → ajustado para caber exactamente 2 filas en la página
-        rows.push(new TableRow({
-          children: cells,
-          height: { value: 6000, rule: 'atLeast' }
-        }));
+        rows.push(new TableRow({ children: cells, height: { value: 6000, rule: 'atLeast' } }));
       }
 
-      const table = new Table({
-        rows,
-        width: { size: 100, type: WidthType.PERCENTAGE },
-        borders: {
-          top:              { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' },
-          bottom:           { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' },
-          left:             { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' },
-          right:            { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' },
-          insideHorizontal: { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' },
-          insideVertical:   { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' },
-        }
-      });
-
-      // ── Sección de la hoja ────────────────────────────────────────────────
-      // Orientación VERTICAL (portrait): width=12240 twips (21.59 cm), height=15840 twips (27.94 cm)
-      // Equivalente a una hoja carta, que es más común que A4 en Colombia.
-      // Para A4 usar: width=11906, height=16838
+      const NO = { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' };
       sections.push({
         properties: {
           page: {
-            size: {
-              width:  12240,   // Carta ancho (portrait)
-              height: 15840,   // Carta alto  (portrait)
-              orientation: 'portrait'
-            },
-            margin: {
-              top:    1000,   // ≈1.76 cm  (espacio para header)
-              right:   600,   // ≈1.06 cm
-              bottom:  600,
-              left:    600,
-              header:  300,
-              footer:  200
-            }
-          }
+            size: { width: 12240, height: 15840, orientation: 'portrait' },
+            margin: { top: 1000, right: 600, bottom: 600, left: 600, header: 300, footer: 200 },
+          },
         },
-        headers: {
-          default: pageHeader
-        },
-        children: [table]
+        headers: { default: header },
+        children: [new Table({
+          rows,
+          width: { size: 100, type: WidthType.PERCENTAGE },
+          borders: { top: NO, bottom: NO, left: NO, right: NO, insideHorizontal: NO, insideVertical: NO },
+        })],
       });
     }
   }
 
-  const doc = new Document({ sections });
+  const buffer = await Packer.toBuffer(new Document({ sections }));
+  fs.writeFileSync(OUTPUT_FILE, buffer);
 
-  const buffer = await Packer.toBuffer(doc);
-  const outPath = 'Comprobantes_Descargados.docx';
-  fs.writeFileSync(outPath, buffer);
-
-  console.log(`\n✅ Documento guardado: ${outPath}`);
-  console.log(`   Mensajeros procesados : ${senderOrder.length}`);
-  console.log(`   Hojas generadas       : ${sections.length}`);
-  console.log(`   Comprobantes totales  : ${receipts.length}\n`);
+  console.log(`\n✅ Documento listo → ${OUTPUT_FILE}`);
+  console.log(`   Mensajeros   : ${order.length}`);
+  console.log(`   Hojas        : ${sections.length}`);
+  console.log(`   Comprobantes : ${receipts.length}\n`);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// CELDA DE COMPROBANTE — Layout vertical optimizado
-// ─────────────────────────────────────────────────────────────────────────────
-function createReceiptCell(receipt) {
+// ── Celda con imagen ──────────────────────────────────────────────────────────
+function receiptCell(receipt) {
+  const G = { style: BorderStyle.SINGLE, size: 1, color: 'cccccc' };
   return new TableCell({
-    // 3 columnas → cada una ocupa ~33% del ancho útil
-    width:  { size: 3333, type: WidthType.DXA },
-    margins: { top: 0, bottom: 0, left: 0, right: 0 }, // Eliminar márgenes verticales
+    width: { size: 3333, type: WidthType.DXA },
+    margins: { top: 0, bottom: 0, left: 0, right: 0 },
     verticalAlign: VerticalAlign.CENTER,
-    borders: {
-      top:    { style: BorderStyle.SINGLE, size: 1, color: 'cccccc' }, // Bordes más delgados
-      bottom: { style: BorderStyle.SINGLE, size: 1, color: 'cccccc' },
-      left:   { style: BorderStyle.SINGLE, size: 1, color: 'cccccc' }, // Bordes más delgados
-      right:  { style: BorderStyle.SINGLE, size: 1, color: 'cccccc' },
-    },
+    borders: { top: G, bottom: G, left: G, right: G },
     children: [
-      // Fecha y hora del comprobante
       new Paragraph({
         alignment: AlignmentType.CENTER,
-        spacing: { before: 0, after: 5 }, // Reducir aún más el espacio después de la fecha
-        children: [
-          new TextRun({ text: receipt.date, bold: true, size: 12, color: '333333' }) // Texto aún más pequeño
-        ]
+        spacing: { before: 0, after: 5 },
+        children: [new TextRun({ text: receipt.date, bold: true, size: 12, color: '333333' })],
       }),
-      // Imagen del comprobante
       new Paragraph({
         alignment: AlignmentType.CENTER,
         spacing: { before: 0, after: 0 },
-        children: [
-          new ImageRun({
-            data: receipt.imageBuffer,
-            transformation: {
-              width:  230,   // Ajustado para caber mejor en el espacio disponible
-              height: 420    // Alto proporcional manteniendo ratio ~1:1.83
-            }
-          })
-        ]
-      })
-    ]
+        children: [new ImageRun({ data: receipt.imageBuffer, transformation: { width: 230, height: 420 } })],
+      }),
+    ],
   });
 }
 
-// Ejecutar todo
-main();
+// ── Celda vacía ───────────────────────────────────────────────────────────────
+function emptyCell() {
+  const NO = { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' };
+  return new TableCell({
+    children: [new Paragraph({ text: '' })],
+    width: { size: 3333, type: WidthType.DXA },
+    borders: { top: NO, bottom: NO, left: NO, right: NO },
+  });
+}
+
+main().catch(err => {
+  console.error('\n❌ Error fatal:', err.message);
+  process.exit(1);
+});
