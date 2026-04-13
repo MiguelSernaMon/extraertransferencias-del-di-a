@@ -1,5 +1,11 @@
 node_modules/
+baileys_auth/
+baileys_auth_info/
 .wwebjs_auth/
+.wwebjs_cache/
 group_cache.json
-Comprobantes_Descargados.docx
+group_messages_cache.json
+name_cache.json
+*.docx
 .DS_Store
+temp_index_copy.txt

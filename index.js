@@ -32,15 +32,108 @@ const {
 } = require('docx');
 
 // ─── Config ─────────────────────────────────────────────────────────────────
-const GROUP_NAME  = 'TRANSFERENCIAS RED POSTAL POBLADO';
-const AUTH_FOLDER = './baileys_auth';
-const CACHE_FILE  = './group_cache.json';
-const OUTPUT_FILE = 'Comprobantes_Descargados.docx';
+const GROUP_NAME    = 'TRANSFERENCIAS RED POSTAL POBLADO';
+const AUTH_FOLDER   = './baileys_auth';
+const CACHE_FILE    = './group_cache.json';
+const MSG_CACHE_FILE  = './group_messages_cache.json';
+const NAME_CACHE_FILE = './name_cache.json';
+const NOMBRES_FILE    = './nombres_mensajeros.json';
+const OUTPUT_FILE     = 'Comprobantes_Descargados.docx';
+
+// Mapeo manual de nombres: teléfono → nombre
+const manualNames = {};
+// Mapeo LID → teléfono (se llena desde groupMetadata)
+const lidToPhone = {};
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 // Reemplaza makeInMemoryStore: guardamos mensajes en un Map simple
 const msgStore = new Map(); // `${jid}:${id}` → msg
+
+// Caché de nombres: jid/lid → nombre de WhatsApp
+const nameCache = new Map();
+
+// Mapa completo de contactos: jid → contact object (incluye lid)
+const contactsMap = {};
+
+/** Registra un contacto en todos los maps disponibles */
+function registerContact(c) {
+  if (!c || !c.id) return;
+  contactsMap[c.id] = c;
+
+  // Extraer nombre del contacto
+  const name = c.name || c.verifiedName || c.notify;
+  if (name) {
+    nameCache.set(c.id, name);
+    // Si tiene LID, también mapear el LID
+    if (c.lid) nameCache.set(c.lid, name);
+  }
+
+  // Si el ID es un LID y tiene nombre, registrar
+  if (c.id.endsWith('@lid') && name) {
+    nameCache.set(c.id, name);
+  }
+}
+
+/** Carga el caché de nombres desde disco */
+function loadNameCache() {
+  if (!fs.existsSync(NAME_CACHE_FILE)) return;
+  try {
+    const data = JSON.parse(fs.readFileSync(NAME_CACHE_FILE, 'utf8'));
+    for (const [jid, name] of Object.entries(data)) {
+      nameCache.set(jid, name);
+    }
+  } catch { /* ignore */ }
+}
+
+/** Guarda el caché de nombres a disco */
+function saveNameCache() {
+  const obj = {};
+  for (const [jid, name] of nameCache) {
+    obj[jid] = name;
+  }
+  fs.writeFileSync(NAME_CACHE_FILE, JSON.stringify(obj, null, 2));
+}
+
+// ─── Caché persistente de mensajes ──────────────────────────────────────────
+
+/** Carga los mensajes cacheados del grupo desde disco */
+function loadCachedGroupMessages() {
+  if (!fs.existsSync(MSG_CACHE_FILE)) return new Map();
+  try {
+    const data = JSON.parse(fs.readFileSync(MSG_CACHE_FILE, 'utf8'));
+    const map = new Map();
+    for (const msg of data) {
+      if (msg.key?.id) map.set(msg.key.id, msg);
+      // Extraer pushNames de mensajes cacheados
+      const participant = msg.key?.participant;
+      if (participant && msg.pushName) {
+        nameCache.set(participant, msg.pushName);
+      }
+    }
+    return map;
+  } catch {
+    return new Map();
+  }
+}
+
+/** Guarda mensajes del grupo a disco (merge con existentes) */
+function saveCachedGroupMessages(groupJid, newMessages) {
+  const cached = loadCachedGroupMessages();
+  let added = 0;
+
+  // Agregar mensajes nuevos del store en memoria
+  for (const [, msg] of newMessages) {
+    if (msg.key?.remoteJid !== groupJid) continue;
+    if (!msg.message?.imageMessage && !msg.message?.documentMessage) continue;
+    if (!cached.has(msg.key.id)) added++;
+    cached.set(msg.key.id, msg);
+  }
+
+  fs.writeFileSync(MSG_CACHE_FILE, JSON.stringify([...cached.values()]));
+  console.log(`💾 Caché actualizado: ${cached.size} comprobantes guardados (+${added} nuevos)`);
+  return cached;
+}
 
 // ════════════════════════════════════════════════════════════════════════════
 // 1. PREGUNTAR FECHAS
@@ -117,21 +210,58 @@ async function createSocket() {
 
   sock.ev.on('creds.update', saveCreds);
 
-  // Guardar mensajes en el store manual
+  // Guardar mensajes en el store manual + extraer pushNames
   sock.ev.on('messages.upsert', ({ messages }) => {
     for (const msg of messages) {
       if (msg.key?.remoteJid && msg.key?.id) {
         msgStore.set(`${msg.key.remoteJid}:${msg.key.id}`, msg);
       }
+      // Extraer pushName para el caché de nombres
+      const participant = msg.key?.participant;
+      if (participant && msg.pushName) {
+        nameCache.set(participant, msg.pushName);
+      }
     }
   });
 
-  sock.ev.on('messaging-history.set', ({ messages }) => {
+  sock.ev.on('messaging-history.set', (data) => {
+    const { messages = [], contacts: syncContacts = [], isLatest } = data;
+
+    // Guardar mensajes
     for (const msg of messages) {
       if (msg.key?.remoteJid && msg.key?.id) {
         msgStore.set(`${msg.key.remoteJid}:${msg.key.id}`, msg);
       }
+      const participant = msg.key?.participant;
+      if (participant && msg.pushName) {
+        nameCache.set(participant, msg.pushName);
+      }
     }
+
+    // Registrar contactos del history sync (clave para mapear LIDs)
+    if (syncContacts && syncContacts.length > 0) {
+      for (const c of syncContacts) {
+        registerContact(c);
+      }
+    }
+  });
+
+  // Capturar también los contactos de los eventos dedicados
+  sock.ev.on('contacts.set',    ({ contacts: list }) => {
+    if (list) list.forEach(c => registerContact(c));
+  });
+  sock.ev.on('contacts.upsert', list => {
+    if (list) list.forEach(c => registerContact(c));
+  });
+  sock.ev.on('contacts.update', list => {
+    if (list) list.forEach(c => {
+      if (c.id && contactsMap[c.id]) {
+        Object.assign(contactsMap[c.id], c);
+        registerContact(contactsMap[c.id]);
+      } else {
+        registerContact(c);
+      }
+    });
   });
 
   return sock;
@@ -369,10 +499,20 @@ async function downloadImage(sock, msg) {
 // 7. NOMBRE DEL REMITENTE
 // ════════════════════════════════════════════════════════════════════════════
 function getSenderName(msg, contacts) {
-  const jid    = msg.key.participant ?? msg.key.remoteJid;
-  const number = jid.split('@')[0];
-  const c      = contacts[jid];
-  return c?.name || c?.notify || number;
+  const jid = msg.key.participant ?? msg.key.remoteJid;
+
+  // 1. Buscar en nombres manuales (archivo nombres_mensajeros.json)
+  //    El jid puede ser un LID → convertir a teléfono → buscar nombre manual
+  const phone = lidToPhone[jid] || jid.split('@')[0];
+  if (manualNames[phone]) return manualNames[phone];
+
+  // 2. Buscar en contactos sincronizados y caché
+  const c = contacts[jid] || contactsMap[jid];
+  const name = c?.name || c?.verifiedName || msg.pushName || nameCache.get(jid) || c?.notify;
+  if (name) return name;
+
+  // 3. Mostrar el número de teléfono (más útil que el LID)
+  return phone;
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -383,6 +523,13 @@ async function main() {
   const startTs = Math.floor(startDate.getTime() / 1000);
   const endTs   = Math.floor(endDate.getTime()   / 1000);
 
+  // ── Cargar cachés de ejecuciones previas ─────────────────────────────────
+  loadNameCache();
+  const previousCache = loadCachedGroupMessages();
+  if (previousCache.size > 0) {
+    console.log(`📦 Caché local: ${previousCache.size} comprobantes, ${nameCache.size} nombres guardados`);
+  }
+
   // ── Conexión con reintentos automáticos ───────────────────────────────────
   let sock;
   let contacts = {};
@@ -392,9 +539,6 @@ async function main() {
     console.log(`🔄 Conectando con WhatsApp (intento ${attempt}/${MAX_RETRIES})...\n`);
     contacts = {};
     sock = await createSocket();
-
-    sock.ev.on('contacts.set',    ({ contacts: list }) => list.forEach(c => { contacts[c.id] = c; }));
-    sock.ev.on('contacts.upsert', list               => list.forEach(c => { contacts[c.id] = c; }));
 
     const result = await waitForOpen(sock);
 
@@ -412,58 +556,108 @@ async function main() {
 
   const groupJid = await findGroupJid(sock);
 
+  // ── Obtener participantes y construir mapeo LID → teléfono ────────────────
+  try {
+    const metadata = await sock.groupMetadata(groupJid);
+
+    // Construir mapeo LID → teléfono desde metadata del grupo
+    for (const p of metadata.participants) {
+      const phoneLid = p.lid || p.id;
+      const phoneJid = p.jid || p.id;
+      const phoneNum = phoneJid.split('@')[0];
+
+      // Mapear LID → número de teléfono
+      if (phoneLid) lidToPhone[phoneLid] = phoneNum;
+      if (p.id) lidToPhone[p.id] = phoneNum;
+    }
+
+    // Generar/actualizar archivo de nombres manuales
+    if (fs.existsSync(NOMBRES_FILE)) {
+      // Cargar nombres existentes
+      try {
+        const existing = JSON.parse(fs.readFileSync(NOMBRES_FILE, 'utf8'));
+        Object.assign(manualNames, existing);
+      } catch { /* ignore */ }
+
+      // Agregar nuevos participantes que no estén en el archivo
+      let newEntries = 0;
+      for (const p of metadata.participants) {
+        const phoneNum = (p.jid || p.id).split('@')[0];
+        if (!manualNames[phoneNum]) {
+          manualNames[phoneNum] = '';
+          newEntries++;
+        }
+      }
+      if (newEntries > 0) {
+        fs.writeFileSync(NOMBRES_FILE, JSON.stringify(manualNames, null, 2));
+        console.log(`   📝 ${newEntries} nuevos participantes agregados al archivo de nombres`);
+      }
+    } else {
+      // Primera vez: crear archivo con todos los participantes
+      for (const p of metadata.participants) {
+        const phoneNum = (p.jid || p.id).split('@')[0];
+        manualNames[phoneNum] = '';
+      }
+      fs.writeFileSync(NOMBRES_FILE, JSON.stringify(manualNames, null, 2));
+      console.log(`\n  ╔══════════════════════════════════════════════════════╗`);
+      console.log(`  ║  📋 ARCHIVO DE NOMBRES CREADO                        ║`);
+      console.log(`  ║                                                      ║`);
+      console.log(`  ║  Abre: nombres_mensajeros.json                       ║`);
+      console.log(`  ║  Pon el nombre de cada mensajero junto a su número.  ║`);
+      console.log(`  ║  Ejemplo: "573001234567": "JUAN PÉREZ"                ║`);
+      console.log(`  ╚══════════════════════════════════════════════════════╝\n`);
+    }
+
+    // Contar nombres asignados
+    const assigned = Object.values(manualNames).filter(n => n).length;
+    console.log(`👥 Participantes: ${metadata.participants.length}, nombres asignados: ${assigned}/${Object.keys(manualNames).length}`);
+  } catch (err) {
+    console.log(`  ⚠ No se pudo obtener metadata del grupo: ${err.message}`);
+  }
+
   console.log('⏳ Esperando sincronización de historial...');
   console.log('   (30-90 s la primera vez; más rápido en ejecuciones siguientes)');
-  console.log(`   🔎 Rango de búsqueda: startTs=${startTs} endTs=${endTs}`);
-  console.log(`   🔎 Inicio: ${new Date(startTs * 1000).toLocaleString('es-CO')}`);
-  console.log(`   🔎 Fin:    ${new Date(endTs * 1000).toLocaleString('es-CO')}`);
-  console.log(`   🔎 Mensajes en store antes de recolectar: ${msgStore.size}\n`);
+  console.log(`   🔎 Rango: ${new Date(startTs * 1000).toLocaleString('es-CO')} → ${new Date(endTs * 1000).toLocaleString('es-CO')}\n`);
 
   // Manejar cierre de conexión durante la recolección
-  let connectionLost = false;
   const onClose = ({ connection }) => {
     if (connection === 'close') {
-      connectionLost = true;
       console.log('\n  ⚠ Conexión cerrada durante sincronización, procesando lo recolectado...');
     }
   };
   sock.ev.on('connection.update', onClose);
 
-  const rawMsgs = await collectMessages(sock, groupJid, startTs, endTs);
+  await collectMessages(sock, groupJid, startTs, endTs);
 
   sock.ev.off('connection.update', onClose);
 
-  console.log(`\n📊 Total comprobantes en el rango: ${rawMsgs.length}`);
-  console.log(`📊 Mensajes totales en store: ${msgStore.size}`);
+  // ── Guardar TODOS los mensajes nuevos al caché persistente ────────────────
+  const allCached = saveCachedGroupMessages(groupJid, msgStore);
+
+  // ── Guardar caché de nombres ────────────────────────────────────────────
+  saveNameCache();
+  console.log(`👤 Nombres cacheados: ${nameCache.size}`);
+
+  // ── Filtrar por rango de fechas desde el caché completo ───────────────────
+  const rawMsgs = [];
+  for (const [, msg] of allCached) {
+    const ts = toUnix(msg.messageTimestamp);
+    if (ts >= startTs && ts <= endTs) {
+      rawMsgs.push(msg);
+    }
+  }
+
+  // Ordenar por fecha
+  rawMsgs.sort((a, b) => toUnix(a.messageTimestamp) - toUnix(b.messageTimestamp));
+
+  console.log(`📊 Total comprobantes en el rango: ${rawMsgs.length}`);
 
   if (rawMsgs.length === 0) {
-    // Intentar buscar directamente en el store como último recurso
-    console.log('\n🔄 Verificando store completo por si los mensajes se etiquetaron diferente...');
-    let storeGroupMsgs = 0;
-    let storeGroupMedia = 0;
-    for (const [, msg] of msgStore.entries()) {
-      if (msg.key?.remoteJid === groupJid) {
-        storeGroupMsgs++;
-        const ts = toUnix(msg.messageTimestamp);
-        const hasImage = !!msg.message?.imageMessage;
-        const hasDoc = !!msg.message?.documentMessage;
-        if (hasImage || hasDoc) storeGroupMedia++;
-        // Mostrar algunos mensajes del grupo para diagnóstico
-        if (storeGroupMsgs <= 5) {
-          const date = new Date(ts * 1000);
-          const types = Object.keys(msg.message || {}).join(', ');
-          console.log(`   Msg ${storeGroupMsgs}: ts=${ts} (${date.toLocaleString('es-CO')}) tipos=[${types}]`);
-        }
-      }
-    }
-    console.log(`   Total mensajes del grupo en store: ${storeGroupMsgs}`);
-    console.log(`   Mensajes con media en store:       ${storeGroupMedia}`);
-
     console.log('\n⚠  No se encontraron imágenes en el rango seleccionado.');
-    console.log('   Posibles causas:');
-    console.log('   1. El historial no se sincronizó completamente.');
-    console.log('   2. Las fechas seleccionadas no coinciden con los mensajes.');
-    console.log('   → Intenta borrar la carpeta "baileys_auth" y reescanea el QR.\n');
+    console.log('   Si es la primera vez que usas la app, los mensajes');
+    console.log('   se guardaron en caché y estarán disponibles en');
+    console.log('   las próximas ejecuciones.');
+    console.log('   Si no aparecen, borra "baileys_auth" y reescanea el QR.\n');
     try { await sock.end(); } catch { /* ignore */ }
     process.exit(0);
   }
