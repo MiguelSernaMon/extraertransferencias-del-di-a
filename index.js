@@ -39,6 +39,10 @@ const MSG_CACHE_FILE  = './group_messages_cache.json';
 const NAME_CACHE_FILE = './name_cache.json';
 const NOMBRES_FILE    = './nombres_mensajeros.json';
 const OUTPUT_FILE     = 'Comprobantes_Descargados.docx';
+const BAD_MAC_THRESHOLD = 5;
+const MAX_AUTO_HEAL_RETRIES = 1;
+const AUTO_HEAL_CONNECT_RETRIES = 5;
+const TRANSIENT_CONN_THRESHOLD = 2;
 
 // Mapeo manual de nombres: teléfono → nombre
 const manualNames = {};
@@ -46,6 +50,80 @@ const manualNames = {};
 const lidToPhone = {};
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// Tracker global para detectar sesión dañada por errores de descifrado
+const badMacTracker = { count: 0, installed: false };
+const transientConnTracker = { count: 0, installed: false };
+
+function isTransientConnectionClosedError(err) {
+  if (!err) return false;
+
+  const msg = String(err?.message || err || '');
+  const statusCode = err?.output?.statusCode || err?.data?.statusCode;
+  const payloadMsg = String(err?.output?.payload?.message || '');
+
+  return (
+    msg.includes('Connection Closed') ||
+    payloadMsg.includes('Connection Closed') ||
+    statusCode === 428
+  );
+}
+
+function installRuntimeErrorGuards() {
+  if (transientConnTracker.installed) return;
+  transientConnTracker.installed = true;
+
+  process.on('unhandledRejection', (reason) => {
+    if (isTransientConnectionClosedError(reason)) {
+      transientConnTracker.count += 1;
+      console.log('⚠ Evento transitorio de conexión (428 Connection Closed). Se aplicará reconexión automática.');
+      return;
+    }
+    console.error('❌ Rechazo no manejado:', reason?.message || reason);
+  });
+
+  process.on('uncaughtException', (err) => {
+    if (isTransientConnectionClosedError(err)) {
+      transientConnTracker.count += 1;
+      console.log('⚠ Excepción transitoria de conexión capturada. Continuando con recuperación automática...');
+      return;
+    }
+
+    console.error('\n❌ Error inesperado:', err?.message || err);
+    process.exit(1);
+  });
+}
+
+function installBadMacFilter() {
+  if (badMacTracker.installed) return;
+  badMacTracker.installed = true;
+
+  const originalError = console.error.bind(console);
+  console.error = (...args) => {
+    const line = args.map(a => (typeof a === 'string' ? a : String(a))).join(' ');
+    const isBadMac =
+      line.includes('Failed to decrypt message with any known session') ||
+      line.includes('Bad MAC');
+
+    if (isBadMac) {
+      badMacTracker.count += 1;
+      // Mostrar solo un aviso resumido para no saturar la consola
+      if (badMacTracker.count === 1) {
+        originalError('⚠ Detectados errores de descifrado (Bad MAC). Intentaremos autorreparar la sesión automáticamente.');
+      }
+      return;
+    }
+
+    originalError(...args);
+  };
+}
+
+function shouldAutoHealSession(stats) {
+  const noHistorySync = stats.historyChunks === 0 && stats.totalMsgsReceived === 0;
+  const manyDecryptErrors = badMacTracker.count >= BAD_MAC_THRESHOLD;
+  const manyTransientConnErrors = transientConnTracker.count >= TRANSIENT_CONN_THRESHOLD;
+  return noHistorySync || manyDecryptErrors || manyTransientConnErrors;
+}
 
 // Reemplaza makeInMemoryStore: guardamos mensajes en un Map simple
 const msgStore = new Map(); // `${jid}:${id}` → msg
@@ -277,7 +355,20 @@ function waitForOpen(sock) {
       180_000
     );
 
-    sock.ev.on('connection.update', ({ connection, lastDisconnect, qr }) => {
+    let settled = false;
+    const cleanup = () => {
+      clearTimeout(timer);
+      sock.ev.off('connection.update', onConnectionUpdate);
+    };
+
+    const safeResolve = (value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(value);
+    };
+
+    const onConnectionUpdate = ({ connection, lastDisconnect, qr }) => {
       if (qr) {
         console.log('\n══════════════════════════════════════════════════════');
         console.log('  ESCANEA ESTE CÓDIGO QR CON WHATSAPP');
@@ -287,29 +378,30 @@ function waitForOpen(sock) {
         });
       }
       if (connection === 'open') {
-        clearTimeout(timer);
         console.log('✅ Conectado a WhatsApp.\n');
-        resolve('open');
+        safeResolve('open');
       }
       if (connection === 'close') {
-        clearTimeout(timer);
         const code = lastDisconnect?.error?.output?.statusCode;
         if (code === DisconnectReason.loggedOut) {
           console.log('\n⚠  Sesión cerrada. Elimina "baileys_auth" y reescanea el QR.\n');
           fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
-          resolve('loggedOut');
+          safeResolve('loggedOut');
           return;
         }
         // 515 = restartRequired: WhatsApp pide reconectar
         if (code === 515 || code === DisconnectReason.restartRequired) {
           console.log('⚠  WhatsApp pidió reconexión (515). Reintentando...\n');
-          resolve('restart');
+          safeResolve('restart');
           return;
         }
         console.log(`⚠  Conexión cerrada (código ${code}). Reintentando...\n`);
-        resolve('restart');
+        safeResolve('restart');
       }
-    });
+
+    };
+
+    sock.ev.on('connection.update', onConnectionUpdate);
   });
 }
 
@@ -401,7 +493,15 @@ function collectMessages(sock, groupJid, startTs, endTs) {
       }
 
       console.log(`\n  📈 Debug: ${historyChunks} chunks de historial, ${totalMsgsReceived} mensajes totales recibidos, ${totalGroupMsgs} del grupo`);
-      resolve([...collected.values()]);
+      resolve({
+        messages: [...collected.values()],
+        stats: {
+          historyChunks,
+          totalMsgsReceived,
+          totalGroupMsgs,
+          totalCollected: collected.size,
+        }
+      });
     };
 
     const resetIdle = () => {
@@ -515,10 +615,35 @@ function getSenderName(msg, contacts) {
   return phone;
 }
 
+async function reconnectWithRetries(maxRetries, phaseLabel) {
+  let sock;
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    console.log(`🔄 ${phaseLabel} (intento ${attempt}/${maxRetries})...\n`);
+    sock = await createSocket();
+
+    const result = await waitForOpen(sock);
+    if (result === 'open') return sock;
+
+    try { await sock.end(); } catch { /* ignore */ }
+
+    if (attempt < maxRetries) {
+      await sleep(3_000);
+    }
+  }
+
+  throw new Error(`No fue posible completar "${phaseLabel}" después de ${maxRetries} intentos.`);
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // 8. MAIN
 // ════════════════════════════════════════════════════════════════════════════
 async function main() {
+  installRuntimeErrorGuards();
+  installBadMacFilter();
+  badMacTracker.count = 0;
+  transientConnTracker.count = 0;
+
   const { startDate, endDate } = await askDateRange();
   const startTs = Math.floor(startDate.getTime() / 1000);
   const endTs   = Math.floor(endDate.getTime()   / 1000);
@@ -531,30 +656,10 @@ async function main() {
   }
 
   // ── Conexión con reintentos automáticos ───────────────────────────────────
-  let sock;
+  let sock = await reconnectWithRetries(5, 'Conectando con WhatsApp');
   let contacts = {};
-  const MAX_RETRIES = 5;
 
-  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-    console.log(`🔄 Conectando con WhatsApp (intento ${attempt}/${MAX_RETRIES})...\n`);
-    contacts = {};
-    sock = await createSocket();
-
-    const result = await waitForOpen(sock);
-
-    if (result === 'open')      break;
-    if (result === 'loggedOut') process.exit(1);
-
-    // restart / retry: destruir socket y volver a intentar
-    try { await sock.end(); } catch { /* ignore */ }
-    if (attempt === MAX_RETRIES) {
-      console.error('❌ No se pudo conectar después de varios intentos.');
-      process.exit(1);
-    }
-    await sleep(3_000);
-  }
-
-  const groupJid = await findGroupJid(sock);
+  let groupJid = await findGroupJid(sock);
 
   // ── Obtener participantes y construir mapeo LID → teléfono ────────────────
   try {
@@ -627,7 +732,31 @@ async function main() {
   };
   sock.ev.on('connection.update', onClose);
 
-  await collectMessages(sock, groupJid, startTs, endTs);
+  let collection = await collectMessages(sock, groupJid, startTs, endTs);
+
+  let healAttempt = 0;
+  while (shouldAutoHealSession(collection.stats) && healAttempt < MAX_AUTO_HEAL_RETRIES) {
+    healAttempt++;
+    console.log('\n🛠 Modo autorreparación: detectamos sesión inestable o sin sincronización de historial.');
+    console.log('   Se renovará la sesión automáticamente para que no tengas que borrar carpetas manualmente.\n');
+
+    try { await sock.end(); } catch { /* ignore */ }
+    fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
+    msgStore.clear();
+    badMacTracker.count = 0;
+  transientConnTracker.count = 0;
+
+    console.log(`🔄 Reconectando con sesión limpia (${healAttempt}/${MAX_AUTO_HEAL_RETRIES})...\n`);
+    sock = await reconnectWithRetries(
+      AUTO_HEAL_CONNECT_RETRIES,
+      'Reabriendo WhatsApp durante autorreparación'
+    );
+
+    groupJid = await findGroupJid(sock);
+
+    console.log('⏳ Reintentando sincronización de historial con sesión renovada...\n');
+    collection = await collectMessages(sock, groupJid, startTs, endTs);
+  }
 
   sock.ev.off('connection.update', onClose);
 
@@ -657,7 +786,7 @@ async function main() {
     console.log('   Si es la primera vez que usas la app, los mensajes');
     console.log('   se guardaron en caché y estarán disponibles en');
     console.log('   las próximas ejecuciones.');
-    console.log('   Si no aparecen, borra "baileys_auth" y reescanea el QR.\n');
+  console.log('   El sistema intentó autorrepararse; si persiste, vuelve a ejecutar y espera 1-2 minutos extra de sincronización.\n');
     try { await sock.end(); } catch { /* ignore */ }
     process.exit(0);
   }
