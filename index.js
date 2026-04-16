@@ -43,6 +43,10 @@ const BAD_MAC_THRESHOLD = 5;
 const MAX_AUTO_HEAL_RETRIES = 1;
 const AUTO_HEAL_CONNECT_RETRIES = 5;
 const TRANSIENT_CONN_THRESHOLD = 2;
+const SYNC_IDLE_MS_NORMAL = 30_000;
+const SYNC_IDLE_MS_FAST = 10_000;
+const SYNC_GLOBAL_MS_NORMAL = 180_000;
+const SYNC_GLOBAL_MS_FAST = 60_000;
 
 // Mapeo manual de nombres: teléfono → nombre
 const manualNames = {};
@@ -211,6 +215,26 @@ function saveCachedGroupMessages(groupJid, newMessages) {
   fs.writeFileSync(MSG_CACHE_FILE, JSON.stringify([...cached.values()]));
   console.log(`💾 Caché actualizado: ${cached.size} comprobantes guardados (+${added} nuevos)`);
   return cached;
+}
+
+function getCacheRangeStats(cacheMap, startTs, endTs) {
+  let inRange = 0;
+  let minTs = Number.MAX_SAFE_INTEGER;
+  let maxTs = 0;
+
+  for (const [, msg] of cacheMap) {
+    const ts = toUnix(msg.messageTimestamp);
+    if (!ts) continue;
+    if (ts < minTs) minTs = ts;
+    if (ts > maxTs) maxTs = ts;
+    if (ts >= startTs && ts <= endTs) inRange++;
+  }
+
+  return {
+    inRange,
+    minTs: minTs === Number.MAX_SAFE_INTEGER ? 0 : minTs,
+    maxTs,
+  };
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -458,8 +482,11 @@ function toUnix(ts) {
   return Number(ts);
 }
 
-function collectMessages(sock, groupJid, startTs, endTs) {
+function collectMessages(sock, groupJid, startTs, endTs, options = {}) {
   return new Promise(resolve => {
+    const idleMs = options.idleMs ?? SYNC_IDLE_MS_NORMAL;
+    const globalMs = options.globalMs ?? SYNC_GLOBAL_MS_NORMAL;
+
     const collected = new Map();
     let idleTimer;
     let globalTimer;
@@ -467,6 +494,7 @@ function collectMessages(sock, groupJid, startTs, endTs) {
     let historyChunks = 0;
     let totalMsgsReceived = 0;
     let totalGroupMsgs = 0;
+    let oldestGroupTsSeen = Number.MAX_SAFE_INTEGER;
 
     const finish = () => {
       if (finished) return;
@@ -506,11 +534,11 @@ function collectMessages(sock, groupJid, startTs, endTs) {
 
     const resetIdle = () => {
       clearTimeout(idleTimer);
-      // Esperar 30s en lugar de 15s para dar tiempo a la sincronización
+      // Espera adaptativa: normal o rápida si ya hay buen caché local
       idleTimer = setTimeout(() => {
         process.stdout.write('\n  ⏱ Sin más mensajes entrantes. Continuando...\n');
         finish();
-      }, 30_000);
+      }, idleMs);
     };
 
     const isMedia = msg =>
@@ -523,6 +551,7 @@ function collectMessages(sock, groupJid, startTs, endTs) {
       totalGroupMsgs++;
 
       const ts = toUnix(msg.messageTimestamp);
+  if (ts > 0 && ts < oldestGroupTsSeen) oldestGroupTsSeen = ts;
 
       // Debug: mostrar primer mensaje del grupo para verificar timestamps
       if (totalGroupMsgs <= 3) {
@@ -548,6 +577,16 @@ function collectMessages(sock, groupJid, startTs, endTs) {
       historyChunks++;
       console.log(`  📥 Chunk de historial #${historyChunks}: ${msgs.length} mensajes (isLatest=${isLatest})`);
       msgs.forEach(m => addMsg(m, 'history'));
+
+      // Corte temprano: si ya llegamos a mensajes anteriores al inicio del rango,
+      // no hace falta seguir sincronizando todo el historial.
+      if (oldestGroupTsSeen < startTs) {
+        process.stdout.write('\n  ⚡ Ya alcanzamos mensajes más viejos que el inicio del rango. Cerrando sincronización anticipadamente...\n');
+        clearTimeout(idleTimer);
+        idleTimer = setTimeout(finish, 2_500);
+        return;
+      }
+
       resetIdle();
       if (isLatest) {
         process.stdout.write('\n  ✅ Historial sincronizado.\n');
@@ -571,7 +610,7 @@ function collectMessages(sock, groupJid, startTs, endTs) {
     globalTimer = setTimeout(() => {
       process.stdout.write('\n  ⏱ Tiempo máximo alcanzado.\n');
       finish();
-    }, 180_000);
+    }, globalMs);
 
     resetIdle();
   });
@@ -651,8 +690,12 @@ async function main() {
   // ── Cargar cachés de ejecuciones previas ─────────────────────────────────
   loadNameCache();
   const previousCache = loadCachedGroupMessages();
+  const previousCacheStats = getCacheRangeStats(previousCache, startTs, endTs);
   if (previousCache.size > 0) {
     console.log(`📦 Caché local: ${previousCache.size} comprobantes, ${nameCache.size} nombres guardados`);
+    if (previousCacheStats.inRange > 0) {
+      console.log(`⚡ Cache-hit en rango: ${previousCacheStats.inRange} comprobantes ya estaban guardados`);
+    }
   }
 
   // ── Conexión con reintentos automáticos ───────────────────────────────────
@@ -732,7 +775,30 @@ async function main() {
   };
   sock.ev.on('connection.update', onClose);
 
-  let collection = await collectMessages(sock, groupJid, startTs, endTs);
+  const nowTs = Math.floor(Date.now() / 1000);
+  const rangeAlreadyCoveredByCache =
+    previousCacheStats.inRange > 0 &&
+    previousCacheStats.maxTs >= endTs &&
+    endTs <= nowTs - 300;
+
+  const useFastSync = previousCacheStats.inRange > 0;
+  const collectOptions = useFastSync
+    ? { idleMs: SYNC_IDLE_MS_FAST, globalMs: SYNC_GLOBAL_MS_FAST }
+    : { idleMs: SYNC_IDLE_MS_NORMAL, globalMs: SYNC_GLOBAL_MS_NORMAL };
+
+  let collection;
+  if (rangeAlreadyCoveredByCache) {
+    console.log('⚡ Rango ya cubierto por caché local. Omitiendo sincronización completa para acelerar.\n');
+    collection = {
+      messages: [],
+      stats: { historyChunks: 1, totalMsgsReceived: 1, totalGroupMsgs: 1, totalCollected: 0 }
+    };
+  } else {
+    if (useFastSync) {
+      console.log('⚡ Activando sincronización rápida (hay caché previa en el rango).\n');
+    }
+    collection = await collectMessages(sock, groupJid, startTs, endTs, collectOptions);
+  }
 
   let healAttempt = 0;
   while (shouldAutoHealSession(collection.stats) && healAttempt < MAX_AUTO_HEAL_RETRIES) {
