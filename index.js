@@ -185,17 +185,41 @@ const nameCache = new Map();
 // Mapa completo de contactos: jid → contact object (incluye lid)
 const contactsMap = {};
 
+// Nombre del grupo: quirk de baileys — en el sync de historial, pushName de
+// mensajes de grupo llega como el NOMBRE DEL GRUPO, no el del remitente.
+// Todo nombre sospechoso de ser el grupo se descarta (daría filas con el
+// nombre del grupo para todos los mensajeros en Windows/sesiones nuevas).
+let knownGroupName = '';
+
+/** true si el nombre parece ser el del grupo (pushName envenenado). */
+function isGroupNameLike(name) {
+  if (!knownGroupName || !name) return false;
+  const g = knownGroupName.toLowerCase().trim();
+  const n = String(name).toLowerCase().trim();
+  return n === g || n.includes(g);
+}
+
+/** pushName limpio: devuelve el nombre solo si no parece el del grupo. */
+function cleanPushName(pushName) {
+  return pushName && !isGroupNameLike(pushName) ? pushName : null;
+}
+
 /** Registra un contacto en todos los maps disponibles */
 function registerContact(c) {
   if (!c || !c.id) return;
   contactsMap[c.id] = c;
 
-  // Extraer nombre del contacto
-  const name = c.name || c.verifiedName || c.notify;
-  if (name) {
+  // Extraer nombre del contacto (notify puede ser pushName envenenado → filtrar)
+  const name = c.name || c.verifiedName || cleanPushName(c.notify);
+  if (name && !isGroupNameLike(name)) {
     nameCache.set(c.id, name);
     // Si tiene LID, también mapear el LID
     if (c.lid) nameCache.set(c.lid, name);
+  }
+
+  // Reforzar mapeo LID → teléfono (el archivo manual se busca por teléfono)
+  if (c.lid && c.jid) {
+    lidToPhone[c.lid] = c.jid.split('@')[0];
   }
 
   // Si el ID es un LID y tiene nombre, registrar
@@ -240,7 +264,7 @@ function loadCachedGroupMessages() {
     if (msg.key?.id) map.set(msg.key.id, msg);
     // Extraer pushNames de mensajes cacheados
     const participant = msg.key?.participant;
-    if (participant && msg.pushName) {
+    if (participant && cleanPushName(msg.pushName)) {
       nameCache.set(participant, msg.pushName);
     }
   }
@@ -373,7 +397,7 @@ async function createSocket() {
       }
       // Extraer pushName para el caché de nombres
       const participant = msg.key?.participant;
-      if (participant && msg.pushName) {
+      if (participant && cleanPushName(msg.pushName)) {
         nameCache.set(participant, msg.pushName);
       }
     }
@@ -388,7 +412,7 @@ async function createSocket() {
         msgStore.set(`${msg.key.remoteJid}:${msg.key.id}`, msg);
       }
       const participant = msg.key?.participant;
-      if (participant && msg.pushName) {
+      if (participant && cleanPushName(msg.pushName)) {
         nameCache.set(participant, msg.pushName);
       }
     }
@@ -500,6 +524,7 @@ async function findGroupJid(sock) {
   const { data } = loadJSONFile(CACHE_FILE);
   if (data) {
     const { groupJid, groupName } = data;
+    knownGroupName = groupName || '';
     console.log(`📦 Grupo en caché: ${groupName}`);
     return groupJid;
   }
@@ -524,6 +549,7 @@ async function findGroupJid(sock) {
     throw new Error('Grupo no encontrado.');
   }
 
+  knownGroupName = match.subject || '';
   atomicWriteFileSync(CACHE_FILE, JSON.stringify({ groupJid: match.id, groupName: match.subject }));
   console.log(`✅ Grupo: ${match.subject}\n`);
   return match.id;
@@ -1087,9 +1113,15 @@ function getSenderName(msg, contacts) {
   const phone = lidToPhone[jid] || jid.split('@')[0];
   if (manualNames[phone]) return manualNames[phone];
 
-  // 2. Buscar en contactos sincronizados y caché
+  // 2. Buscar en contactos sincronizados y caché (nunca el nombre del grupo)
   const c = contacts[jid] || contactsMap[jid];
-  const name = c?.name || c?.verifiedName || msg.pushName || nameCache.get(jid) || c?.notify;
+  const cached = nameCache.get(jid);
+  const name =
+    c?.name ||
+    c?.verifiedName ||
+    cleanPushName(msg.pushName) ||
+    (cached && !isGroupNameLike(cached) ? cached : null) ||
+    cleanPushName(c?.notify);
   if (name) return name;
 
   // 3. Mostrar el número de teléfono (más útil que el LID)
@@ -1164,6 +1196,7 @@ async function main() {
   // ── Obtener participantes y construir mapeo LID → teléfono ────────────────
   try {
     const metadata = await sock.groupMetadata(groupJid);
+    knownGroupName = metadata.subject || knownGroupName;
 
     // Construir mapeo LID → teléfono desde metadata del grupo
     for (const p of metadata.participants) {
@@ -1567,4 +1600,10 @@ module.exports = {
   backupSessionSnapshot,
   tryRestoreSessionSnapshot,
   _setBadMacCount: n => { badMacTracker.count = n; }, // hook solo para tests
+  _setKnownGroupName: n => { knownGroupName = n; },   // hook solo para tests
+  _setManualName: (phone, name) => { manualNames[phone] = name; }, // hook solo para tests
+  _setLidToPhone: (lid, phone) => { lidToPhone[lid] = phone; },    // hook solo para tests
+  cleanPushName,
+  isGroupNameLike,
+  getSenderName,
 };
