@@ -20,6 +20,7 @@ const {
   loadJSONFile,
   isValidJpeg,
 } = require('./fs_utils');
+const { askDateRangeWeb } = require('./picker');
 
 const {
   default: makeWASocket,
@@ -1079,7 +1080,11 @@ async function main() {
   badMacTracker.count = 0;
   transientConnTracker.count = 0;
 
-  const { startDate, endDate } = await askDateRange();
+  // Selector de fechas: navegador por defecto; --terminal conserva los prompts de texto
+  const useWebPicker = !process.argv.includes('--terminal');
+  const { startDate, endDate } = useWebPicker
+    ? await askDateRangeWeb()
+    : await askDateRange();
   const startTs = Math.floor(startDate.getTime() / 1000);
   const endTs   = Math.floor(endDate.getTime()   / 1000);
 
