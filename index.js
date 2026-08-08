@@ -195,6 +195,10 @@ let knownGroupName = '';
 // ("MENSAJERO: 120363192583651767"). Con esto salen con tu nombre.
 let ownName = 'YO';
 
+// Contadores de diagnóstico por remitente: algunos mensajes de history sync
+// en Windows llegan SIN key.participant → el reporte los une todos en "sdc".
+let senderDiag = { sin: 0, con: 0, propios: 0 };
+
 // Lista de participantes para el panel web (mapeo de IDs → nombres)
 let participantList = [];
 const participantLids = new Set();
@@ -692,7 +696,10 @@ function collectMessages(sock, groupJid, startTs, endTs, options = {}) {
 
       if (ts < startTs || ts > endTs) return;
       if (!isMedia(msg)) return;
-      if (!collected.has(msg.key.id)) {
+      const existing = collected.get(msg.key.id);
+      // Preferir la copia CON participant (los upsert en vivo la traen; las
+      // copias del history sync pueden venir sin ella en sesiones nuevas)
+      if (!existing || (msg.key?.participant && !existing.key?.participant)) {
         collected.set(msg.key.id, msg);
         process.stdout.write(`\r  📨 Comprobantes encontrados: ${collected.size}   `);
       }
@@ -910,6 +917,8 @@ async function phase1_downloadFromCdn(messages, concurrency = 2) {
     expired: 0,    // necesita re-upload (404/410/timeout)
     failed: 0,     // error permanente o no imagen
   };
+  // Diagnóstico de remitentes (Windows reportaba todo como un solo mensajero)
+  senderDiag = { sin: 0, con: 0, propios: 0 };
   const expiredMessages = [];  // mensajes que necesitan fase 2
 
   let completed = 0;
@@ -969,6 +978,10 @@ async function phase1_downloadFromCdn(messages, concurrency = 2) {
         writeProgress();
         continue;
       }
+
+      if (!msg.key?.participant) senderDiag.sin++;
+      else senderDiag.con++;
+      if (msg.key?.fromMe) senderDiag.propios++;
 
       receipts.push({
         imageBuffer: result.buffer,
@@ -1032,6 +1045,10 @@ async function phase2_reuploadExpired(sock, expiredMessages) {
         msg.message?.documentMessage?.mimetype ?? '';
 
       if (mimetype.startsWith('image/')) {
+        if (!msg.key?.participant) senderDiag.sin++;
+        else senderDiag.con++;
+        if (msg.key?.fromMe) senderDiag.propios++;
+
         receipts.push({
           imageBuffer: result.buffer,
           senderName: getSenderName(msg, {}),
@@ -1107,6 +1124,8 @@ async function downloadAllTwoPhase(messages, sock) {
     console.log(`     ❌ No disponible: ${phase2.stats.permanent}`);
     console.log(`     ⚠ Otros fallos  : ${phase2.stats.failed}`);
 
+    console.log(`  📊 Remitentes: ${senderDiag.con} con participant | ${senderDiag.sin} SIN participant | ${senderDiag.propios} propios`);
+
     // Juntar receipts
     const allReceipts = [...phase1.receipts, ...phase2.receipts];
 
@@ -1124,6 +1143,8 @@ async function downloadAllTwoPhase(messages, sock) {
       },
     };
   }
+
+  console.log(`  📊 Remitentes: ${senderDiag.con} con participant | ${senderDiag.sin} SIN participant | ${senderDiag.propios} propios`);
 
   return {
     receipts: phase1.receipts,
@@ -1144,9 +1165,9 @@ async function downloadAllTwoPhase(messages, sock) {
 // 7. NOMBRE DEL REMITENTE
 // ════════════════════════════════════════════════════════════════════════════
 function getSenderName(msg, contacts) {
-  // Mensaje propio o sin remitente identificable (participant es obligatorio
-  // para mensajes de otros miembros): remoteJid sería el GRUPO → nombre propio.
-  if (!msg.key?.participant) return ownName || 'YO';
+  // Sin participant (history sync): el pushName limpio puede identificar al
+  // remitente; si no hay, es mensaje propio → nombre propio (nunca el grupo).
+  if (!msg.key?.participant) return cleanPushName(msg.pushName) || ownName || 'YO';
 
   const jid = msg.key.participant ?? msg.key.remoteJid;
 
