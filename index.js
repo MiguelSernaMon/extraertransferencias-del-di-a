@@ -45,10 +45,10 @@ const MSG_CACHE_FILE  = './group_messages_cache.json';
 const NAME_CACHE_FILE = './name_cache.json';
 const NOMBRES_FILE    = './nombres_mensajeros.json';
 const OUTPUT_FILE     = 'Comprobantes_Descargados.docx';
-const BAD_MAC_THRESHOLD = 5;
+const BAD_MAC_THRESHOLD = 15;
 const MAX_AUTO_HEAL_RETRIES = 1;
 const AUTO_HEAL_CONNECT_RETRIES = 5;
-const TRANSIENT_CONN_THRESHOLD = 2;
+const SESSION_SNAPSHOT_DIR = './baileys_auth_backup_snapshot';
 const SYNC_IDLE_MS_NORMAL = 30_000;
 const SYNC_IDLE_MS_FAST = 10_000;
 const SYNC_GLOBAL_MS_NORMAL = 180_000;
@@ -132,11 +132,48 @@ function installBadMacFilter() {
   };
 }
 
+/**
+ * Decisión conservadora de autorreparación: borrar/renovar la sesión es caro
+ * (obliga a reescanear el QR), así que solo se hace con evidencia fuerte.
+ *
+ *  - Los errores Bad MAC aislados NO son daño de sesión (un remitente con
+ *    clave vieja genera varios; el resto del grupo sigue descifrando bien).
+ *  - Una sesión realmente rota falla al descifrar TODO → muchos errores Y
+ *    casi cero mensajes válidos recibidos.
+ *  - "No llegaron mensajes en el sync" tampoco es daño de sesión (WhatsApp
+ *    puede no tener nada nuevo, o la red frenó) → NO dispara heal.
+ *  - Errores transitorios de conexión NO disparan heal: baileys se reconecta
+ *    solo conservando la sesión.
+ */
 function shouldAutoHealSession(stats) {
-  const noHistorySync = stats.historyChunks === 0 && stats.totalMsgsReceived === 0;
+  const total = stats?.totalMsgsReceived ?? 0;
   const manyDecryptErrors = badMacTracker.count >= BAD_MAC_THRESHOLD;
-  const manyTransientConnErrors = transientConnTracker.count >= TRANSIENT_CONN_THRESHOLD;
-  return noHistorySync || manyDecryptErrors || manyTransientConnErrors;
+  const almostNothingDecrypted = total < BAD_MAC_THRESHOLD;
+  return manyDecryptErrors && almostNothingDecrypted;
+}
+
+// ── Snapshot de sesión: respaldo para recuperar sin reescanear QR ────────────
+let sessionRestoreAttempted = false;
+
+/** Copia la sesión actual a un snapshot (después de conectar OK). */
+function backupSessionSnapshot() {
+  if (!fs.existsSync(AUTH_FOLDER)) return;
+  try {
+    fs.rmSync(SESSION_SNAPSHOT_DIR, { recursive: true, force: true });
+    fs.cpSync(AUTH_FOLDER, SESSION_SNAPSHOT_DIR, { recursive: true });
+  } catch { /* si no se puede respaldar, seguimos igual */ }
+}
+
+/** Restaura el snapshot sobre la sesión actual. Devuelve true si hubo snapshot. */
+function tryRestoreSessionSnapshot() {
+  if (!fs.existsSync(SESSION_SNAPSHOT_DIR)) return false;
+  try {
+    fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
+    fs.cpSync(SESSION_SNAPSHOT_DIR, AUTH_FOLDER, { recursive: true });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // Reemplaza makeInMemoryStore: guardamos mensajes en un Map simple
@@ -426,6 +463,15 @@ function waitForOpen(sock) {
       if (connection === 'close') {
         const code = lastDisconnect?.error?.output?.statusCode;
         if (code === DisconnectReason.loggedOut) {
+          // Antes de reescanear QR, intentar una sola vez con el snapshot de la
+          // última sesión buena: los loggedOut aislados suelen ser caídas de
+          // WhatsApp, no revocación real. Si el snapshot falla, se borra y QR.
+          if (!sessionRestoreAttempted && tryRestoreSessionSnapshot()) {
+            sessionRestoreAttempted = true;
+            console.log('♻  Sesión caída. Restaurando snapshot de la sesión anterior...\n');
+            safeResolve('restart'); // el próximo intento usa la sesión restaurada
+            return;
+          }
           console.log('\n⚠  Sesión cerrada. Elimina "baileys_auth" y reescanea el QR.\n');
           fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
           safeResolve('loggedOut');
@@ -1060,6 +1106,7 @@ async function reconnectWithRetries(maxRetries, phaseLabel) {
     const result = await waitForOpen(sock);
     if (result === 'open') {
       currentSock = sock;
+      backupSessionSnapshot(); // sesión OK → respaldo para recuperar sin reescanear QR
       return sock;
     }
 
@@ -1221,13 +1268,19 @@ async function main() {
     console.log('   Se renovará la sesión automáticamente para que no tengas que borrar carpetas manualmente.\n');
 
     try { await sock.end(); } catch { /* ignore */ }
-    // Respaldar la sesión en vez de borrarla: si el problema era transitorio,
-    // se puede restaurar la carpeta y volver a conectar sin reescanear QR.
-    try {
-      const backup = `${AUTH_FOLDER}_backup_${Date.now()}`;
-      fs.renameSync(AUTH_FOLDER, backup);
-      console.log(`📦 Sesión anterior respaldada en: ${backup}`);
-    } catch { /* si no existe, no hay nada que respaldar */ }
+    // Primero intentar restaurar el snapshot de la última sesión buena
+    // (evita reescanear QR); si no hay snapshot, respaldar la sesión actual
+    // y arrancar limpio.
+    if (!sessionRestoreAttempted && tryRestoreSessionSnapshot()) {
+      sessionRestoreAttempted = true;
+      console.log('♻  Restaurando snapshot de la sesión anterior para reintentar...');
+    } else {
+      try {
+        const backup = `${AUTH_FOLDER}_backup_${Date.now()}`;
+        fs.renameSync(AUTH_FOLDER, backup);
+        console.log(`📦 Sesión anterior respaldada en: ${backup}`);
+      } catch { /* si no existe, no hay nada que respaldar */ }
+    }
     msgStore.clear();
     badMacTracker.count = 0;
     transientConnTracker.count = 0;
@@ -1510,4 +1563,8 @@ module.exports = {
   saveNameCache,
   loadFailedDownloads,
   saveFailedDownload,
+  shouldAutoHealSession,
+  backupSessionSnapshot,
+  tryRestoreSessionSnapshot,
+  _setBadMacCount: n => { badMacTracker.count = n; }, // hook solo para tests
 };
