@@ -149,18 +149,19 @@ const PAGE_HTML = `<!DOCTYPE html>
       <div class="fsize" id="fsize"></div>
       <a class="dl" id="dl" href="/download" download>⬇ Descargar Word</a>
     </div>
-
-    <!-- FASE 3: mapear mensajeros (IDs → nombres) -->
-    <div class="mapcard hidden" id="mapcard">
-      <div class="maphead">
-        <h3>👥 Mensajeros del grupo</h3>
-        <button id="mapRefresh">Actualizar</button>
-      </div>
-      <p class="mapsub">Poné el nombre de cada mensajero — se guarda al instante en nombres_mensajeros.json y se aplica a este reporte.</p>
-      <div class="maplist" id="maplist"></div>
-      <button class="btn mapbtn" id="mapSaveAll">💾 Guardar todos</button>
-    </div>
   </div>
+
+  <!-- FASE 3: mapear mensajeros (IDs → nombres) — visible desde el inicio -->
+  <div class="mapcard" id="mapcard">
+    <div class="maphead">
+      <h3>👥 Mensajeros del grupo</h3>
+      <button id="mapRefresh">Actualizar</button>
+    </div>
+    <p class="mapsub">Poné el nombre de cada mensajero — se guarda al instante en nombres_mensajeros.json y se aplica a este reporte.</p>
+    <div class="maplist" id="maplist"></div>
+    <button class="btn mapbtn" id="mapSaveAll">💾 Guardar todos</button>
+  </div>
+</div>
 </div>
 
 <script>
@@ -254,10 +255,7 @@ const PAGE_HTML = `<!DOCTYPE html>
     setBadge('✅ proceso finalizado', 'live');
     appendLog('📄 ' + f.name + ' listo (' + (f.size/1024).toFixed(1) + ' KB)');
   });
-  es.addEventListener('participants', e => {
-    $('mapcard').classList.remove('hidden');
-    renderMap(JSON.parse(e.data));
-  });
+  es.addEventListener('participants', e => renderMap(JSON.parse(e.data)));
   es.onopen = () => setBadge('conectado', 'live');
   es.onerror = () => setBadge('reconectando…', 'wait');
 

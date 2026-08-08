@@ -199,6 +199,36 @@ let ownName = 'YO';
 let participantList = [];
 const participantLids = new Set();
 
+function senderToEntry(lid, phone) {
+  return {
+    lid,
+    phone: phone || null,
+    name: manualNames[phone] || manualNames[lid] || manualNames[lid?.split('@')[0]] || '',
+  };
+}
+
+/** Rellena el panel SIN conectar: remitentes del caché local + archivo de nombres. */
+function pushEarlyParticipants() {
+  loadManualNames(); // nombres + mapeo persistido del archivo
+  const senders = new Map();
+  try {
+    const msgs = JSON.parse(fs.readFileSync(MSG_CACHE_FILE, 'utf8'));
+    if (Array.isArray(msgs)) {
+      for (const m of msgs) {
+        const lid = m.key?.participant;
+        if (lid && lid.endsWith('@lid')) senders.set(lid, lidToPhone[lid] || null);
+      }
+    }
+  } catch { /* todavía no hay caché: el panel muestra vacío hasta conectar */ }
+  participantList = [];
+  participantLids.clear();
+  for (const [lid, phone] of senders) {
+    participantLids.add(lid);
+    participantList.push(senderToEntry(lid, phone));
+  }
+  if (activePicker) activePicker.setParticipants(participantList);
+}
+
 /** true si el nombre parece ser el del grupo (pushName envenenado). */
 function isGroupNameLike(name) {
   if (!knownGroupName || !name) return false;
@@ -1215,6 +1245,8 @@ async function main() {
       try { saveManualNames(); }
       catch (err) { activePicker.pushLog('⚠ No se pudo guardar nombres: ' + err.message); }
     });
+    // Lista inicial de mensajeros desde el caché local (sin esperar conexión)
+    pushEarlyParticipants();
   }
   const { startDate, endDate } = useWebPicker
     ? await activePicker.waitForRange()
@@ -1292,17 +1324,20 @@ async function main() {
     const assigned = Object.values(manualNames).filter(n => n).length;
     console.log(`👥 Participantes: ${metadata.participants.length}, nombres asignados: ${assigned}/${Object.keys(manualNames).length}`);
 
-    // Panel web: lista de participantes para mapear IDs → nombres
-    participantList = metadata.participants.map(p => {
+    // Panel web: fusionar metadata con la lista temprana del caché
+    for (const p of metadata.participants) {
       const lid = p.lid || p.id;
       const phone = p.jid ? p.jid.split('@')[0] : null;
       participantLids.add(lid);
-      return {
-        lid,
-        phone,
-        name: manualNames[phone] || manualNames[lid] || manualNames[lid?.split('@')[0]] || '',
-      };
-    });
+      const existing = participantList.find(e => e.lid === lid);
+      const entry = senderToEntry(lid, phone);
+      if (existing) {
+        existing.phone = entry.phone || existing.phone;
+        existing.name = entry.name || existing.name;
+      } else {
+        participantList.push(entry);
+      }
+    }
     if (activePicker) activePicker.setParticipants(participantList);
   } else {
     // Sin metadata: cargar igual lo persistido para que el mapeo siga funcionando
@@ -1680,10 +1715,13 @@ module.exports = {
   getSenderName,
   loadManualNames,
   saveManualNames,
+  pushEarlyParticipants,
+  senderToEntry,
   _resetNamesState: () => {
     Object.keys(manualNames).forEach(k => delete manualNames[k]);
     Object.keys(lidToPhone).forEach(k => delete lidToPhone[k]);
     participantList = [];
     participantLids.clear();
   }, // hook solo para tests
+  _setActivePicker: p => { activePicker = p; }, // hook solo para tests
 };
