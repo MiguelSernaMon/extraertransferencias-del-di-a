@@ -1,11 +1,16 @@
 node_modules/
 baileys_auth/
+baileys_auth_backup_*/
 baileys_auth_info/
 .wwebjs_auth/
 .wwebjs_cache/
 group_cache.json
 group_messages_cache.json
 name_cache.json
+failed_downloads.json
+media_cache/
 *.docx
 .DS_Store
 temp_index_copy.txt
+*.tmp
+*.corrupt-*

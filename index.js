@@ -15,6 +15,11 @@ const fs     = require('fs');
 const QRCode = require('qrcode');
 const { prompt } = require('enquirer');
 const pino = require('pino');
+const {
+  atomicWriteFileSync,
+  loadJSONFile,
+  isValidJpeg,
+} = require('./fs_utils');
 
 const {
   default: makeWASocket,
@@ -47,6 +52,10 @@ const SYNC_IDLE_MS_NORMAL = 30_000;
 const SYNC_IDLE_MS_FAST = 10_000;
 const SYNC_GLOBAL_MS_NORMAL = 180_000;
 const SYNC_GLOBAL_MS_FAST = 60_000;
+const FAILED_CACHE_FILE = './failed_downloads.json';
+const MEDIA_CACHE_DIR   = './media_cache';
+const MAX_CONCURRENT_DOWNLOADS = 2;
+const MAX_DOWNLOAD_RETRIES = 4;
 
 // Mapeo manual de nombres: teléfono → nombre
 const manualNames = {};
@@ -159,47 +168,48 @@ function registerContact(c) {
 
 /** Carga el caché de nombres desde disco */
 function loadNameCache() {
-  if (!fs.existsSync(NAME_CACHE_FILE)) return;
-  try {
-    const data = JSON.parse(fs.readFileSync(NAME_CACHE_FILE, 'utf8'));
-    for (const [jid, name] of Object.entries(data)) {
-      nameCache.set(jid, name);
-    }
-  } catch { /* ignore */ }
+  const { data, corrupt } = loadJSONFile(NAME_CACHE_FILE);
+  if (corrupt) {
+    console.log('   Se regenerará el caché de nombres desde cero.');
+  }
+  if (!data) return;
+  for (const [jid, name] of Object.entries(data)) {
+    nameCache.set(jid, name);
+  }
 }
 
-/** Guarda el caché de nombres a disco */
+/** Guarda el caché de nombres a disco (escritura atómica) */
 function saveNameCache() {
   const obj = {};
   for (const [jid, name] of nameCache) {
     obj[jid] = name;
   }
-  fs.writeFileSync(NAME_CACHE_FILE, JSON.stringify(obj, null, 2));
+  atomicWriteFileSync(NAME_CACHE_FILE, JSON.stringify(obj, null, 2));
 }
 
 // ─── Caché persistente de mensajes ──────────────────────────────────────────
 
 /** Carga los mensajes cacheados del grupo desde disco */
 function loadCachedGroupMessages() {
-  if (!fs.existsSync(MSG_CACHE_FILE)) return new Map();
-  try {
-    const data = JSON.parse(fs.readFileSync(MSG_CACHE_FILE, 'utf8'));
-    const map = new Map();
-    for (const msg of data) {
-      if (msg.key?.id) map.set(msg.key.id, msg);
-      // Extraer pushNames de mensajes cacheados
-      const participant = msg.key?.participant;
-      if (participant && msg.pushName) {
-        nameCache.set(participant, msg.pushName);
-      }
-    }
-    return map;
-  } catch {
-    return new Map();
+  const { data, corrupt } = loadJSONFile(MSG_CACHE_FILE);
+  if (corrupt) {
+    console.log('⚠  El caché de comprobantes estaba dañado. Se respaldó el archivo original');
+    console.log('   (podés recuperar datos manualmente desde ese respaldo) y se continúa con caché vacío.\n');
   }
+  if (!data) return new Map();
+  const map = new Map();
+  for (const msg of data) {
+    if (msg.key?.id) map.set(msg.key.id, msg);
+    // Extraer pushNames de mensajes cacheados
+    const participant = msg.key?.participant;
+    if (participant && msg.pushName) {
+      nameCache.set(participant, msg.pushName);
+    }
+  }
+  return map;
 }
 
-/** Guarda mensajes del grupo a disco (merge con existentes) */
+/** Guarda mensajes del grupo a disco (merge con existentes, escritura atómica) */
 function saveCachedGroupMessages(groupJid, newMessages) {
   const cached = loadCachedGroupMessages();
   let added = 0;
@@ -212,8 +222,13 @@ function saveCachedGroupMessages(groupJid, newMessages) {
     cached.set(msg.key.id, msg);
   }
 
-  fs.writeFileSync(MSG_CACHE_FILE, JSON.stringify([...cached.values()]));
-  console.log(`💾 Caché actualizado: ${cached.size} comprobantes guardados (+${added} nuevos)`);
+  // No reescribir el archivo entero si no hubo cambios (evita ventana de corrupción innecesaria)
+  if (added > 0) {
+    atomicWriteFileSync(MSG_CACHE_FILE, JSON.stringify([...cached.values()]));
+    console.log(`💾 Caché actualizado: ${cached.size} comprobantes guardados (+${added} nuevos)`);
+  } else {
+    console.log(`💾 Caché sin cambios: ${cached.size} comprobantes (no se reescribió el archivo)`);
+  }
   return cached;
 }
 
@@ -433,14 +448,11 @@ function waitForOpen(sock) {
 // 4. ENCONTRAR JID DEL GRUPO
 // ════════════════════════════════════════════════════════════════════════════
 async function findGroupJid(sock) {
-  if (fs.existsSync(CACHE_FILE)) {
-    try {
-      const { groupJid, groupName } = JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8'));
-      console.log(`📦 Grupo en caché: ${groupName}`);
-      return groupJid;
-    } catch {
-      fs.unlinkSync(CACHE_FILE);
-    }
+  const { data } = loadJSONFile(CACHE_FILE);
+  if (data) {
+    const { groupJid, groupName } = data;
+    console.log(`📦 Grupo en caché: ${groupName}`);
+    return groupJid;
   }
 
   console.log('🔍 Buscando grupo...');
@@ -463,7 +475,7 @@ async function findGroupJid(sock) {
     throw new Error('Grupo no encontrado.');
   }
 
-  fs.writeFileSync(CACHE_FILE, JSON.stringify({ groupJid: match.id, groupName: match.subject }));
+  atomicWriteFileSync(CACHE_FILE, JSON.stringify({ groupJid: match.id, groupName: match.subject }));
   console.log(`✅ Grupo: ${match.subject}\n`);
   return match.id;
 }
@@ -617,21 +629,402 @@ function collectMessages(sock, groupJid, startTs, endTs, options = {}) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// 6. DESCARGAR MEDIA
+// 6. DESCARGAR MEDIA  —  enfoque en dos fases para no desincronizar WhatsApp
 // ════════════════════════════════════════════════════════════════════════════
-async function downloadImage(sock, msg) {
-  try {
-    const buffer = await downloadMediaMessage(
-      msg,
-      'buffer',
-      {},
-      { logger: pino({ level: 'silent' }), reuploadRequest: sock.updateMediaMessage }
-    );
-    return buffer;
-  } catch (err) {
-    process.stdout.write(`\n  ⚠ No se pudo descargar: ${err.message}\n`);
-    return null;
+//
+//  Fase 1 — CDN directo (rápido, concurrente, SIN re-upload):
+//    Descarga todo lo que aún está en los servidores de WhatsApp.
+//    Sin reuploadRequest → no se envían solicitudes al remitente.
+//    WhatsApp no detecta actividad sospechosa.
+//
+//  Fase 2 — Re-upload serial (lento, UNO POR UNO, 25-35s entre cada uno):
+//    Solo para mensajes que fallaron en fase 1 con 404/410.
+//    Imita a un humano dando "retry" manual en WhatsApp.
+//    Un solo worker, delays largos con jitter aleatorio.
+//    WhatsApp lo ve como comportamiento natural.
+
+// ── Caché de fallos permanentes ──────────────────────────────────────────────
+function loadFailedDownloads() {
+  const { data } = loadJSONFile(FAILED_CACHE_FILE);
+  if (!data) return new Set();
+  return new Set(Object.keys(data));
+}
+
+function saveFailedDownload(msgKeyId, errorType) {
+  const { data } = loadJSONFile(FAILED_CACHE_FILE);
+  const existing = (data && typeof data === 'object') ? data : {};
+  existing[msgKeyId] = { error: errorType, date: new Date().toISOString() };
+  atomicWriteFileSync(FAILED_CACHE_FILE, JSON.stringify(existing, null, 2));
+}
+
+// ── Caché local de imágenes descargadas ──────────────────────────────────────
+function getMediaCachePath(msgKeyId) {
+  if (!fs.existsSync(MEDIA_CACHE_DIR)) {
+    fs.mkdirSync(MEDIA_CACHE_DIR, { recursive: true });
   }
+  return `${MEDIA_CACHE_DIR}/${msgKeyId}.jpg`;
+}
+
+function loadCachedMedia(msgKeyId) {
+  const path = getMediaCachePath(msgKeyId);
+  if (fs.existsSync(path)) {
+    try {
+      const buffer = fs.readFileSync(path);
+      // Validar que no sea un JPEG truncado por un crash a mitad de escritura
+      if (isValidJpeg(buffer)) return buffer;
+      fs.rmSync(path, { force: true });
+      console.log(`⚠ Imagen corrupta descartada y será re-descargada: ${msgKeyId}`);
+    } catch { /* ilegible → tratar como no existente */ }
+  }
+  return null;
+}
+
+function saveCachedMedia(msgKeyId, buffer) {
+  try {
+    atomicWriteFileSync(getMediaCachePath(msgKeyId), buffer);
+  } catch { /* ignorar errores de escritura */ }
+}
+
+// ── Clasificación de errores ─────────────────────────────────────────────────
+function isPermanentError(errMsg) {
+  const msg = String(errMsg || '');
+  const permanent = [
+    'DECRYPTION_ERROR',
+    'no content in message',
+    'is not a media message',
+    'No message present',
+    'Invalid media type',
+  ];
+  return permanent.some(p => msg.includes(p));
+}
+
+function isExpiredMediaError(errMsg) {
+  const msg = String(errMsg || '');
+  // Errores que indican que la media ya no está en CDN y necesita re-upload
+  return (
+    msg.includes('NOT_FOUND') ||
+    msg.includes('GENERAL_ERROR') ||
+    msg.includes('TIMEOUT') ||
+    msg.includes('Connection Closed') ||
+    msg.includes('ECONNRESET') ||
+    msg.includes('ETIMEDOUT') ||
+    msg.includes('status code 404') ||
+    msg.includes('status code 410')
+  );
+}
+
+// ── Descarga SIN re-upload (solo CDN) ───────────────────────────────────────
+// Rápida y segura para paralelizar. Si la media expiró, lanza error.
+async function downloadFromCdn(msg, timeoutMs = 20_000) {
+  const msgKeyId = msg.key?.id || 'unknown';
+
+  const cached = loadCachedMedia(msgKeyId);
+  if (cached) return { buffer: cached, source: 'cache' };
+
+  try {
+    const buffer = await Promise.race([
+      // ⚠ Sin ctx → sin reuploadRequest. Si 404/410, tira error enseguida.
+      downloadMediaMessage(msg, 'buffer', {}),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('TIMEOUT')), timeoutMs)
+      ),
+    ]);
+
+    saveCachedMedia(msgKeyId, buffer);
+    return { buffer, source: 'cdn' };
+  } catch (err) {
+    return { buffer: null, error: err.message || String(err), source: 'error' };
+  }
+}
+
+// ── Descarga CON re-upload (serial, un mensaje a la vez) ─────────────────────
+// Lenta. Solo se usa en fase 2, de a uno, con delays largos.
+async function downloadWithReupload(sock, msg, timeoutMs = 40_000) {
+  const msgKeyId = msg.key?.id || 'unknown';
+
+  try {
+    const buffer = await Promise.race([
+      downloadMediaMessage(
+        msg,
+        'buffer',
+        {},
+        {
+          logger: pino({ level: 'silent' }),
+          reuploadRequest: sock.updateMediaMessage,
+        }
+      ),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('TIMEOUT')), timeoutMs)
+      ),
+    ]);
+
+    saveCachedMedia(msgKeyId, buffer);
+    return { buffer, source: 'reupload' };
+  } catch (err) {
+    const errMsg = err.message || String(err);
+
+    // Errores de autenticación / sesión dañada → abortar toda la fase 2
+    if (
+      errMsg.includes('Unsupported state') ||
+      errMsg.includes('unable to authentic') ||
+      errMsg.includes('unauthorized') ||
+      errMsg.includes('Unauthorized') ||
+      errMsg.includes('loggedOut') ||
+      errMsg.includes('session') ||
+      String(err.output?.statusCode) === '401'
+    ) {
+      return { buffer: null, error: errMsg, source: 'auth_error' };
+    }
+
+    // NOT_FOUND genuino tras re-upload: guardar como fallo permanente
+    if (errMsg.includes('NOT_FOUND') || errMsg.includes('DECRYPTION_ERROR')) {
+      saveFailedDownload(msgKeyId, errMsg);
+      return { buffer: null, error: errMsg, source: 'permanent' };
+    }
+    return { buffer: null, error: errMsg, source: 'error' };
+  }
+}
+
+// ── FASE 1: Descarga masiva desde CDN (concurrente, sin re-upload) ───────────
+async function phase1_downloadFromCdn(messages, concurrency = 2) {
+  const failedDownloads = loadFailedDownloads();
+  const total = messages.length;
+  const receipts = [];
+  const stats = {
+    total,
+    ok: 0,
+    fromCache: 0,
+    expired: 0,    // necesita re-upload (404/410/timeout)
+    failed: 0,     // error permanente o no imagen
+  };
+  const expiredMessages = [];  // mensajes que necesitan fase 2
+
+  let completed = 0;
+  let index = 0;
+  let lastProgressLine = '';
+
+  const writeProgress = () => {
+    const active = Math.min(concurrency, total - completed);
+    const line = `\r  [${completed + active}/${total}] ⬇ CDN... `
+      + `(${stats.ok} OK, ${stats.fromCache} caché, ${stats.expired} expirados, ${stats.failed} fallos)   `;
+    if (line !== lastProgressLine) {
+      process.stdout.write(line);
+      lastProgressLine = line;
+    }
+  };
+
+  const worker = async () => {
+    while (index < total) {
+      const i = index++;
+      const msg = messages[i];
+      const msgKeyId = msg.key?.id || `unknown-${i}`;
+
+      // Saltar fallos permanentes previos
+      if (failedDownloads.has(msgKeyId)) {
+        stats.failed++;
+        completed++;
+        writeProgress();
+        continue;
+      }
+
+      const result = await downloadFromCdn(msg);
+
+      if (!result.buffer) {
+        if (isPermanentError(result.error)) {
+          stats.failed++;
+          process.stdout.write(`\n  ⚠ [${i + 1}/${total}] Error perm.: ${String(result.error).slice(0, 50)}`);
+        } else if (isExpiredMediaError(result.error)) {
+          stats.expired++;
+          expiredMessages.push(msg);
+        } else {
+          stats.failed++;
+          process.stdout.write(`\n  ⚠ [${i + 1}/${total}] Error: ${String(result.error).slice(0, 50)}`);
+        }
+        completed++;
+        writeProgress();
+        continue;
+      }
+
+      // Validar mimetype
+      const mimetype =
+        msg.message?.imageMessage?.mimetype ??
+        msg.message?.documentMessage?.mimetype ?? '';
+
+      if (!mimetype.startsWith('image/')) {
+        stats.failed++;
+        completed++;
+        writeProgress();
+        continue;
+      }
+
+      receipts.push({
+        imageBuffer: result.buffer,
+        senderName: getSenderName(msg, {}),
+        date: new Date(toUnix(msg.messageTimestamp) * 1000).toLocaleString('es-CO'),
+      });
+
+      if (result.source === 'cache') {
+        stats.fromCache++;
+      } else {
+        stats.ok++;
+      }
+      completed++;
+      writeProgress();
+    }
+  };
+
+  const workers = [];
+  for (let w = 0; w < concurrency && w < total; w++) {
+    workers.push(worker());
+  }
+  await Promise.all(workers);
+
+  process.stdout.write('\n');
+  return { receipts, expiredMessages, stats };
+}
+
+// ── FASE 2: Re-upload serial (UNO POR UNO, delays largos) ───────────────────
+// Respeta a WhatsApp: un solo worker, 25-35s entre cada solicitud,
+// imita a un humano reintentando manualmente.
+async function phase2_reuploadExpired(sock, expiredMessages) {
+  const total = expiredMessages.length;
+  if (total === 0) return { receipts: [], stats: { ok: 0, failed: 0, permanent: 0 } };
+
+  console.log(`\n  📡 Fase 2: Re-upload serial de ${total} mensajes expirados`);
+  console.log(`     (1 cada ~30s — imitando reintento manual humano)\n`);
+
+  const receipts = [];
+  const stats = { ok: 0, failed: 0, permanent: 0 };
+  const failedDownloads = loadFailedDownloads();
+
+  for (let i = 0; i < total; i++) {
+    const msg = expiredMessages[i];
+    const msgKeyId = msg.key?.id || `unknown-${i}`;
+    const shortId = msgKeyId.slice(0, 14);
+
+    // Saltar fallos permanentes previos
+    if (failedDownloads.has(msgKeyId)) {
+      stats.permanent++;
+      process.stdout.write(`  [${i + 1}/${total}] ⏭ ${shortId} — fallo permanente previo\n`);
+      continue;
+    }
+
+    process.stdout.write(`  [${i + 1}/${total}] 🔄 ${shortId} — solicitando re-upload...`);
+
+    const result = await downloadWithReupload(sock, msg);
+
+    if (result.buffer) {
+      const mimetype =
+        msg.message?.imageMessage?.mimetype ??
+        msg.message?.documentMessage?.mimetype ?? '';
+
+      if (mimetype.startsWith('image/')) {
+        receipts.push({
+          imageBuffer: result.buffer,
+          senderName: getSenderName(msg, {}),
+          date: new Date(toUnix(msg.messageTimestamp) * 1000).toLocaleString('es-CO'),
+        });
+        stats.ok++;
+        process.stdout.write(` ✅\n`);
+      } else {
+        stats.failed++;
+        process.stdout.write(` ⚠ no es imagen\n`);
+      }
+    } else if (result.source === 'auth_error') {
+      // Error de sesión/autenticación: abortar toda la fase 2
+      stats.failed++;
+      const remaining = total - i - 1;
+      process.stdout.write(` 🔒 Sesión dañada — abortando fase 2 (${remaining} pendientes)\n`);
+      console.log(`\n  ⚠ La sesión de WhatsApp necesita reautenticación.`);
+      console.log(`  💡 Borra la carpeta "baileys_auth/" y vuelve a ejecutar.\n`);
+      break;
+    } else {
+      if (result.source === 'permanent') {
+        stats.permanent++;
+        process.stdout.write(` ❌ ${String(result.error).slice(0, 40)}\n`);
+      } else {
+        stats.failed++;
+        process.stdout.write(` ⚠ ${String(result.error).slice(0, 40)}\n`);
+      }
+    }
+
+    // Delay entre re-uploads: 25-35s con jitter aleatorio.
+    // Esto es CLAVE para que WhatsApp no detecte automatización.
+    if (i < total - 1) {
+      const delay = 25_000 + Math.floor(Math.random() * 10_000); // 25-35s
+      const countdown = Math.ceil(delay / 1000);
+      process.stdout.write(`\r  ⏳ Próximo re-upload en ${countdown}s...   `);
+      await sleep(delay);
+      process.stdout.write('\r' + ' '.repeat(45) + '\r');
+    }
+  }
+
+  process.stdout.write('\n');
+  return { receipts, stats };
+}
+
+// ── Orquestador de dos fases ─────────────────────────────────────────────────
+async function downloadAllTwoPhase(messages, sock) {
+  const failedDownloads = loadFailedDownloads();
+
+  // Fase 1: CDN directo, concurrente, sin re-upload
+  console.log(`\n╔══════════════════════════════════════════════════════════╗`);
+  console.log(`║  FASE 1/2 — Descarga directa desde CDN (${MAX_CONCURRENT_DOWNLOADS} workers)       ║`);
+  console.log(`║  Sin solicitar re-upload al remitente                    ║`);
+  console.log(`╚══════════════════════════════════════════════════════════╝\n`);
+
+  const phase1 = await phase1_downloadFromCdn(messages, MAX_CONCURRENT_DOWNLOADS);
+
+  console.log(`\n  📊 Fase 1 completada:`);
+  console.log(`     ✅ CDN / caché : ${phase1.stats.ok + phase1.stats.fromCache}`);
+  console.log(`     📡 Expirados   : ${phase1.stats.expired} (necesitan re-upload)`);
+  console.log(`     ❌ Fallos      : ${phase1.stats.failed}`);
+
+  // Fase 2: Re-upload serial, uno por uno
+  if (phase1.expiredMessages.length > 0) {
+    console.log(`\n╔══════════════════════════════════════════════════════════╗`);
+    console.log(`║  FASE 2/2 — Re-upload serial (1 cada ~30s)              ║`);
+    console.log(`║  Imitando comportamiento humano para evitar baneo       ║`);
+    console.log(`╚══════════════════════════════════════════════════════════╝`);
+
+    const phase2 = await phase2_reuploadExpired(sock, phase1.expiredMessages);
+
+    console.log(`  📊 Fase 2 completada:`);
+    console.log(`     ✅ Recuperados  : ${phase2.stats.ok}`);
+    console.log(`     ❌ No disponible: ${phase2.stats.permanent}`);
+    console.log(`     ⚠ Otros fallos  : ${phase2.stats.failed}`);
+
+    // Juntar receipts
+    const allReceipts = [...phase1.receipts, ...phase2.receipts];
+
+    return {
+      receipts: allReceipts,
+      stats: {
+        total: messages.length,
+        ok: phase1.stats.ok + phase2.stats.ok,
+        fromCache: phase1.stats.fromCache,
+        expired: phase1.stats.expired,
+        reuploadOk: phase2.stats.ok,
+        reuploadFailed: phase2.stats.failed + phase2.stats.permanent,
+        failed: phase1.stats.failed,
+        skippedPermanent: failedDownloads.size,
+      },
+    };
+  }
+
+  return {
+    receipts: phase1.receipts,
+    stats: {
+      total: messages.length,
+      ok: phase1.stats.ok,
+      fromCache: phase1.stats.fromCache,
+      expired: 0,
+      reuploadOk: 0,
+      reuploadFailed: 0,
+      failed: phase1.stats.failed,
+      skippedPermanent: failedDownloads.size,
+    },
+  };
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -662,7 +1055,10 @@ async function reconnectWithRetries(maxRetries, phaseLabel) {
     sock = await createSocket();
 
     const result = await waitForOpen(sock);
-    if (result === 'open') return sock;
+    if (result === 'open') {
+      currentSock = sock;
+      return sock;
+    }
 
     try { await sock.end(); } catch { /* ignore */ }
 
@@ -721,11 +1117,15 @@ async function main() {
 
     // Generar/actualizar archivo de nombres manuales
     if (fs.existsSync(NOMBRES_FILE)) {
-      // Cargar nombres existentes
-      try {
-        const existing = JSON.parse(fs.readFileSync(NOMBRES_FILE, 'utf8'));
-        Object.assign(manualNames, existing);
-      } catch { /* ignore */ }
+      // Cargar nombres existentes (si el archivo está dañado, se respalda y avisa)
+      const { data: existingNames, corrupt } = loadJSONFile(NOMBRES_FILE);
+      if (corrupt) {
+        console.log('⚠  nombres_mensajeros.json estaba dañado. Se respaldó el archivo original');
+        console.log('   — tus nombres siguen en el respaldo y se pueden restaurar manualmente.');
+      }
+      if (existingNames && typeof existingNames === 'object') {
+        Object.assign(manualNames, existingNames);
+      }
 
       // Agregar nuevos participantes que no estén en el archivo
       let newEntries = 0;
@@ -737,7 +1137,7 @@ async function main() {
         }
       }
       if (newEntries > 0) {
-        fs.writeFileSync(NOMBRES_FILE, JSON.stringify(manualNames, null, 2));
+        atomicWriteFileSync(NOMBRES_FILE, JSON.stringify(manualNames, null, 2));
         console.log(`   📝 ${newEntries} nuevos participantes agregados al archivo de nombres`);
       }
     } else {
@@ -746,7 +1146,7 @@ async function main() {
         const phoneNum = (p.jid || p.id).split('@')[0];
         manualNames[phoneNum] = '';
       }
-      fs.writeFileSync(NOMBRES_FILE, JSON.stringify(manualNames, null, 2));
+      atomicWriteFileSync(NOMBRES_FILE, JSON.stringify(manualNames, null, 2));
       console.log(`\n  ╔══════════════════════════════════════════════════════╗`);
       console.log(`  ║  📋 ARCHIVO DE NOMBRES CREADO                        ║`);
       console.log(`  ║                                                      ║`);
@@ -807,10 +1207,16 @@ async function main() {
     console.log('   Se renovará la sesión automáticamente para que no tengas que borrar carpetas manualmente.\n');
 
     try { await sock.end(); } catch { /* ignore */ }
-    fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
+    // Respaldar la sesión en vez de borrarla: si el problema era transitorio,
+    // se puede restaurar la carpeta y volver a conectar sin reescanear QR.
+    try {
+      const backup = `${AUTH_FOLDER}_backup_${Date.now()}`;
+      fs.renameSync(AUTH_FOLDER, backup);
+      console.log(`📦 Sesión anterior respaldada en: ${backup}`);
+    } catch { /* si no existe, no hay nada que respaldar */ }
     msgStore.clear();
     badMacTracker.count = 0;
-  transientConnTracker.count = 0;
+    transientConnTracker.count = 0;
 
     console.log(`🔄 Reconectando con sesión limpia (${healAttempt}/${MAX_AUTO_HEAL_RETRIES})...\n`);
     sock = await reconnectWithRetries(
@@ -833,6 +1239,27 @@ async function main() {
   saveNameCache();
   console.log(`👤 Nombres cacheados: ${nameCache.size}`);
 
+  // ── Cargar fallos permanentes previos ──────────────────────────────────
+  const failedDownloads = loadFailedDownloads();
+  if (failedDownloads.size > 0) {
+    console.log(`📋 ${failedDownloads.size} mensajes con fallos permanentes previos — se omitirán`);
+  }
+
+  // ── Filtrar mensajes ya fallidos del caché y limpiar ────────────────────
+  if (failedDownloads.size > 0) {
+    let cleaned = 0;
+    for (const [key] of allCached) {
+      if (failedDownloads.has(key)) {
+        allCached.delete(key);
+        cleaned++;
+      }
+    }
+    if (cleaned > 0) {
+      atomicWriteFileSync(MSG_CACHE_FILE, JSON.stringify([...allCached.values()]));
+      console.log(`🧹 ${cleaned} mensajes fallidos eliminados del caché de grupo`);
+    }
+  }
+
   // ── Filtrar por rango de fechas desde el caché completo ───────────────────
   const rawMsgs = [];
   for (const [, msg] of allCached) {
@@ -852,38 +1279,31 @@ async function main() {
     console.log('   Si es la primera vez que usas la app, los mensajes');
     console.log('   se guardaron en caché y estarán disponibles en');
     console.log('   las próximas ejecuciones.');
-  console.log('   El sistema intentó autorrepararse; si persiste, vuelve a ejecutar y espera 1-2 minutos extra de sincronización.\n');
+    console.log('   El sistema intentó autorrepararse; si persiste, vuelve a ejecutar y espera 1-2 minutos extra de sincronización.\n');
     try { await sock.end(); } catch { /* ignore */ }
     process.exit(0);
   }
 
-  console.log('\n⬇  Descargando imágenes...\n');
-  const receipts = [];
-
-  for (let i = 0; i < rawMsgs.length; i++) {
-    const msg = rawMsgs[i];
-    process.stdout.write(`\r  [${i + 1}/${rawMsgs.length}] Descargando...`);
-
-    const buffer = await downloadImage(sock, msg);
-    if (!buffer) continue;
-
-    const mimetype =
-      msg.message?.imageMessage?.mimetype ??
-      msg.message?.documentMessage?.mimetype ?? '';
-
-    if (!mimetype.startsWith('image/')) {
-      process.stdout.write(`\n  ⚠ Omitido — no es imagen (${mimetype || 'sin tipo'})\n`);
-      continue;
-    }
-
-    receipts.push({
-      imageBuffer: buffer,
-      senderName:  getSenderName(msg, contacts),
-      date:        new Date(toUnix(msg.messageTimestamp) * 1000).toLocaleString('es-CO'),
-    });
+  // ── Descarga en dos fases ──────────────────────────────────────────────
+  const cacheHits = rawMsgs.filter(m => loadCachedMedia(m.key?.id)).length;
+  if (cacheHits > 0) {
+    console.log(`📦 ${cacheHits} imágenes ya en caché local`);
   }
 
-  console.log(`\n\n✅ Imágenes válidas: ${receipts.length}`);
+  const { receipts, stats: dlStats } = await downloadAllTwoPhase(rawMsgs, sock);
+
+  // ── Resumen de descargas ────────────────────────────────────────────────
+  console.log(`\n${'─'.repeat(55)}`);
+  console.log(`  📊 RESUMEN FINAL`);
+  console.log(`${'─'.repeat(55)}`);
+  console.log(`  Total en rango        : ${dlStats.total}`);
+  console.log(`  ✅ Fase 1 (CDN/caché)  : ${dlStats.ok + dlStats.fromCache}`);
+  console.log(`  📡 Fase 2 (re-upload)  : ${dlStats.reuploadOk} recuperados`);
+  console.log(`  ⏭ Fallos perm. previos : ${dlStats.skippedPermanent} (omitidos)`);
+  console.log(`  ❌ No disponibles      : ${dlStats.reuploadFailed}`);
+  console.log(`  🚫 Otros fallos        : ${dlStats.failed}`);
+  console.log(`  ✅ Imágenes válidas    : ${receipts.length}`);
+  console.log(`${'─'.repeat(55)}\n`);
 
   try { await sock.end(); } catch { /* ignore */ }
 
@@ -973,7 +1393,7 @@ async function createWordDocument(receipts) {
   }
 
   const buffer = await Packer.toBuffer(new Document({ sections }));
-  fs.writeFileSync(OUTPUT_FILE, buffer);
+  atomicWriteFileSync(OUTPUT_FILE, buffer);
 
   console.log(`\n✅ Documento listo → ${OUTPUT_FILE}`);
   console.log(`   Mensajeros   : ${order.length}`);
@@ -1014,7 +1434,37 @@ function emptyCell() {
   });
 }
 
-main().catch(err => {
-  console.error('\n❌ Error fatal:', err.message);
-  process.exit(1);
-});
+// ── Shutdown seguro ───────────────────────────────────────────────────────────
+// Cerrar el socket antes de salir (Ctrl+C / kill) evita que baileys quede
+// a mitad de una escritura de credenciales y corrompa la sesión.
+let currentSock = null;
+
+if (require.main === module) {
+  const handleShutdown = (signal) => {
+    console.log(`\n⚠ ${signal} recibido. Cerrando sesión de forma segura...`);
+    const done = () => process.exit(0);
+    if (currentSock) {
+      Promise.race([currentSock.end(), sleep(5_000)]).catch(() => {}).finally(done);
+    } else {
+      done();
+    }
+  };
+  process.on('SIGINT', () => handleShutdown('SIGINT'));
+  process.on('SIGTERM', () => handleShutdown('SIGTERM'));
+
+  main().catch(err => {
+    console.error('\n❌ Error fatal:', err.message);
+    process.exit(1);
+  });
+}
+
+// Exportado para pruebas unitarias de los helpers de caché
+module.exports = {
+  setCurrentSock: sock => { currentSock = sock; },
+  loadCachedGroupMessages,
+  saveCachedGroupMessages,
+  loadNameCache,
+  saveNameCache,
+  loadFailedDownloads,
+  saveFailedDownload,
+};
