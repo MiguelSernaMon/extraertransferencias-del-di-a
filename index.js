@@ -20,7 +20,7 @@ const {
   loadJSONFile,
   isValidJpeg,
 } = require('./fs_utils');
-const { askDateRangeWeb } = require('./picker');
+const { startControlServer } = require('./picker');
 
 const {
   default: makeWASocket,
@@ -416,6 +416,8 @@ function waitForOpen(sock) {
         QRCode.toString(qr, { type: 'terminal', small: true }, (err, url) => {
           if (!err) console.log(url);
         });
+        // Enviar el QR también al navegador (como imagen)
+        if (activePicker) activePicker.sendQR(qr);
       }
       if (connection === 'open') {
         console.log('✅ Conectado a WhatsApp.\n');
@@ -1080,10 +1082,17 @@ async function main() {
   badMacTracker.count = 0;
   transientConnTracker.count = 0;
 
-  // Selector de fechas: navegador por defecto; --terminal conserva los prompts de texto
+  // Selector de fechas + estado en vivo: navegador por defecto;
+  // --terminal conserva los prompts de texto sin servidor web.
   const useWebPicker = !process.argv.includes('--terminal');
+  if (useWebPicker) {
+    activePicker = await startControlServer();
+    activePicker.attachConsole();   // tee de la consola → página (en vivo)
+    activePicker.openBrowser();
+    console.log(`📡 Panel abierto en el navegador (${activePicker.url})`);
+  }
   const { startDate, endDate } = useWebPicker
-    ? await askDateRangeWeb()
+    ? await activePicker.waitForRange()
     : await askDateRange();
   const startTs = Math.floor(startDate.getTime() / 1000);
   const endTs   = Math.floor(endDate.getTime()   / 1000);
@@ -1285,7 +1294,9 @@ async function main() {
     console.log('   se guardaron en caché y estarán disponibles en');
     console.log('   las próximas ejecuciones.');
     console.log('   El sistema intentó autorrepararse; si persiste, vuelve a ejecutar y espera 1-2 minutos extra de sincronización.\n');
+    if (activePicker) activePicker.pushLog('⚠ No se encontraron comprobantes en el rango seleccionado.');
     try { await sock.end(); } catch { /* ignore */ }
+    await flushPickerBeforeExit();
     process.exit(0);
   }
 
@@ -1314,10 +1325,28 @@ async function main() {
 
   if (receipts.length === 0) {
     console.log('⚠  Nada que exportar.\n');
+    if (activePicker) activePicker.pushLog('⚠ Nada que exportar.');
+    await flushPickerBeforeExit();
     process.exit(0);
   }
 
   await createWordDocument(receipts);
+
+  if (activePicker) {
+    // Notificar al navegador para mostrar el botón de descarga
+    activePicker.notifyFile(OUTPUT_FILE);
+    activePicker.pushLog('✅ Proceso completo. Descargá el archivo desde el navegador.');
+
+    // Mantener el servidor vivo hasta que descargues (o 5 min sin hacerlo).
+    // Si saliéramos enseguida, el navegador mostraría "comprobá tu conexión".
+    const result = await activePicker.waitForDownloadOrTimeout(300_000);
+    if (result === 'downloaded') {
+      activePicker.pushLog('👋 Descarga recibida. Cerrando aplicación...');
+      await sleep(2_000); // margen para descargas repetidas
+    } else {
+      activePicker.pushLog('👋 Sin descarga en 5 minutos. Cerrando aplicación...');
+    }
+  }
   process.exit(0);
 }
 
@@ -1443,6 +1472,15 @@ function emptyCell() {
 // Cerrar el socket antes de salir (Ctrl+C / kill) evita que baileys quede
 // a mitad de una escritura de credenciales y corrompa la sesión.
 let currentSock = null;
+
+// Panel de control web (null en modo --terminal)
+let activePicker = null;
+
+/** Da unos segundos al navegador para recibir los últimos eventos SSE antes de salir. */
+async function flushPickerBeforeExit() {
+  if (!activePicker) return;
+  await sleep(1_500);
+}
 
 if (require.main === module) {
   const handleShutdown = (signal) => {

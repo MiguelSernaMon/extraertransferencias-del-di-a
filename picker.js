@@ -1,24 +1,39 @@
 'use strict';
 
 /**
- * Selector de rango de fechas en el navegador.
+ * Panel de control en el navegador para la extracción.
  *
- * Levanta un servidor HTTP local (node:http, sin dependencias), abre el
- * navegador con un calendario visual (presets + inputs nativos de fecha/hora)
- * y espera a que el usuario envíe el rango. La validación final ocurre
- * en el servidor (autoritativa), la del navegador es solo feedback inline.
+ * Levanta un servidor HTTP local (node:http, sin dependencias nuevas) con:
  *
- * Uso desde index.js:
- *   const { startDate, endDate } = await askDateRangeWeb();
+ *   1. SELECCIÓN DE RANGO — página con presets + inputs nativos de fecha/hora;
+ *      la validación final ocurre en el servidor (autoritativa).
  *
- * Fallback si no se quiere el navegador: flag --terminal en index.js
- * conserva los prompts de enquirer.
+ *   2. ESTADO EN VIVO — después de enviar el rango, la página muestra:
+ *        • el QR de WhatsApp como imagen (QRCode.toDataURL, lib ya instalada)
+ *        • el log de la terminal en tiempo real (Server-Sent Events, SSE)
+ *        • el archivo Word generado con botón de descarga
+ *
+ * El servidor solo escucha en 127.0.0.1. Se unref() para no mantener vivo
+ * el proceso al terminar.
+ *
+ * Flujo desde index.js:
+ *   const picker = await startControlServer();
+ *   picker.attachConsole();                 // tee console → página
+ *   const range = await picker.waitForRange();
+ *   ... (cuando llega QR) picker.sendQR(qr)
+ *   ... (al final)         picker.notifyFile(OUTPUT_FILE)
  */
 
 const http = require('http');
+const fs = require('fs');
+const path = require('path');
 const { spawn } = require('child_process');
+const QRCode = require('qrcode');
 
-const PICKER_TIMEOUT_MS = 600_000; // 10 min esperando al usuario
+const PICKER_TIMEOUT_MS = 600_000;  // 10 min esperando el rango
+const EVENT_BUFFER_MAX = 200;
+const SSE_KEEPALIVE_MS = 25_000;
+const DOCX_MIME = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
 
 const PAGE_HTML = `<!DOCTYPE html>
 <html lang="es">
@@ -26,14 +41,14 @@ const PAGE_HTML = `<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="icon" href="data:,">
-<title>Transferencias del día — Rango de fechas</title>
+<title>Transferencias del día — Panel</title>
 <style>
   :root { --azul:#003399; --borde:#c9d4e4; --bg:#f4f7fb; }
   * { box-sizing:border-box; }
   body { font-family:'Segoe UI',system-ui,sans-serif; background:var(--bg); margin:0;
-         display:flex; min-height:100vh; align-items:center; justify-content:center; }
+         display:flex; min-height:100vh; align-items:center; justify-content:center; padding:16px; }
   .card { background:#fff; border-radius:12px; box-shadow:0 8px 30px rgba(0,51,153,.12);
-          padding:32px 36px; width:560px; max-width:95vw; }
+          padding:32px 36px; width:580px; max-width:100%; }
   h1 { font-size:20px; color:var(--azul); margin:0 0 4px; }
   .sub { color:#667; font-size:13px; margin:0 0 20px; }
   .presets { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:22px; }
@@ -46,45 +61,76 @@ const PAGE_HTML = `<!DOCTYPE html>
                  font-size:15px; font-family:inherit; }
   .field input:focus { outline:2px solid rgba(0,51,153,.25); border-color:var(--azul); }
   .msg { min-height:20px; font-size:13px; margin-top:14px; }
-  .msg.err { color:#c0392b; }
-  .msg.warn { color:#b7791f; }
-  .msg.ok { color:#1e7e34; }
+  .msg.err { color:#c0392b; } .msg.warn { color:#b7791f; } .msg.ok { color:#1e7e34; }
   .btn { margin-top:6px; width:100%; background:var(--azul); color:#fff; border:0; padding:13px;
          border-radius:8px; font-size:16px; font-weight:600; cursor:pointer; font-family:inherit; }
-  .btn:hover { background:#002a7d; }
-  .btn:disabled { background:#9db4d8; cursor:default; }
+  .btn:hover { background:#002a7d; } .btn:disabled { background:#9db4d8; cursor:default; }
   .note { font-size:12px; color:#889; text-align:center; margin-top:16px; }
+  .hidden { display:none; }
+  .qrbox { text-align:center; margin:10px 0 4px; }
+  .qrbox img { width:280px; height:280px; image-rendering:pixelated; }
+  .logbox { background:#10141c; color:#d6e2f0; border-radius:8px; padding:10px 12px;
+            font-family:ui-monospace,Consolas,monospace; font-size:12px; line-height:1.5;
+            height:260px; overflow-y:auto; margin:14px 0 6px; white-space:pre-wrap; word-break:break-word; }
+  .fileready { border:1px solid #b8e0c0; background:#f0faf2; border-radius:8px; padding:14px 16px; margin-top:14px; }
+  .fileready .fname { font-weight:600; color:#1e5a2e; font-size:15px; }
+  .fileready .fsize { color:#557; font-size:12px; margin-top:2px; }
+  .dl { display:inline-block; margin-top:10px; background:#1e7e34; color:#fff; text-decoration:none;
+        padding:11px 18px; border-radius:8px; font-weight:600; font-size:14px; }
+  .dl:hover { background:#175f28; }
+  .badge { display:inline-block; font-size:11px; font-weight:600; padding:3px 10px; border-radius:12px; }
+  .badge.wait { background:#fef3c7; color:#8a6d1a; }
+  .badge.live { background:#dcfce7; color:#166534; }
 </style>
 </head>
 <body>
 <div class="card">
   <h1>📊 Transferencias del día</h1>
-  <p class="sub">Seleccioná el rango de fechas a extraer (máximo 1 semana)</p>
+  <p class="sub" id="subtitle">Seleccioná el rango de fechas a extraer (máximo 1 semana)</p>
 
-  <div class="presets">
-    <button data-start="-1" data-end="0">Ayer → Hoy</button>
-    <button data-start="0" data-end="0">Solo hoy</button>
-    <button data-start="-1" data-end="-1">Solo ayer</button>
-    <button data-start="-2" data-end="0">Últimos 3 días</button>
-    <button data-start="week" data-end="0">Esta semana</button>
+  <!-- FASE 1: rango -->
+  <div id="rangePhase">
+    <div class="presets">
+      <button data-start="-1" data-end="0">Ayer → Hoy</button>
+      <button data-start="0" data-end="0">Solo hoy</button>
+      <button data-start="-1" data-end="-1">Solo ayer</button>
+      <button data-start="-2" data-end="0">Últimos 3 días</button>
+      <button data-start="week" data-end="0">Esta semana</button>
+    </div>
+    <div class="range">
+      <div class="field">
+        <label>DESDE</label>
+        <input type="date" id="startDate">
+        <input type="time" id="startTime" value="08:30" style="margin-top:6px">
+      </div>
+      <div class="field">
+        <label>HASTA</label>
+        <input type="date" id="endDate">
+        <input type="time" id="endTime" value="23:59" style="margin-top:6px">
+      </div>
+    </div>
+    <div class="msg" id="msg"></div>
+    <button class="btn" id="go">▶ EMPEZAR EXTRACCIÓN</button>
+    <p class="note">Al enviar, la página pasa a modo estado y la terminal sigue mostrando todo.</p>
   </div>
 
-  <div class="range">
-    <div class="field">
-      <label>DESDE</label>
-      <input type="date" id="startDate">
-      <input type="time" id="startTime" value="08:30" style="margin-top:6px">
+  <!-- FASE 2: estado en vivo -->
+  <div id="statusPhase" class="hidden">
+    <p class="sub">
+      <span class="badge wait" id="phaseBadge">esperando conexión…</span>
+      &nbsp;El progreso también se muestra en la terminal.
+    </p>
+    <div class="qrbox hidden" id="qrbox">
+      <img id="qrImg" alt="Código QR — escanealo con WhatsApp">
+      <p class="note">Escaneá este QR con WhatsApp → Dispositivos vinculados.</p>
     </div>
-    <div class="field">
-      <label>HASTA</label>
-      <input type="date" id="endDate">
-      <input type="time" id="endTime" value="23:59" style="margin-top:6px">
+    <div class="logbox" id="log"></div>
+    <div class="fileready hidden" id="fileready">
+      <div class="fname" id="fname"></div>
+      <div class="fsize" id="fsize"></div>
+      <a class="dl" id="dl" href="/download" download>⬇ Descargar Word</a>
     </div>
   </div>
-
-  <div class="msg" id="msg"></div>
-  <button class="btn" id="go">▶ EMPEZAR EXTRACCIÓN</button>
-  <p class="note">El QR de WhatsApp aparecerá en la terminal. Podés cerrar esta pestaña al terminar.</p>
 </div>
 
 <script>
@@ -95,7 +141,6 @@ const PAGE_HTML = `<!DOCTYPE html>
     return y + '-' + m + '-' + d;
   };
   const off = n => { const x = new Date(); x.setDate(x.getDate() + n); return x; };
-
   const now = new Date();
   $('startDate').value = fmt(off(-1));
   $('endDate').value = fmt(now);
@@ -104,69 +149,83 @@ const PAGE_HTML = `<!DOCTYPE html>
     const s = new Date($('startDate').value + 'T' + ($('startTime').value || '00:00'));
     const e = new Date($('endDate').value + 'T' + ($('endTime').value || '23:59'));
     const msg = $('msg');
-    if (isNaN(s) || isNaN(e)) {
-      msg.textContent = 'Completá las fechas y horas.';
-      msg.className = 'msg err';
-      return null;
-    }
-    if (e <= s) {
-      msg.textContent = '❌ La fecha/hora FIN debe ser posterior al INICIO.';
-      msg.className = 'msg err';
-      return null;
-    }
-    if (e - s > 7 * DAY) {
-      msg.textContent = '⚠ Supera 1 semana. ¿Estás seguro?';
-      msg.className = 'msg warn';
-    } else {
-      msg.textContent = '';
-    }
+    if (isNaN(s) || isNaN(e)) { msg.textContent = 'Completá las fechas y horas.'; msg.className = 'msg err'; return null; }
+    if (e <= s) { msg.textContent = '❌ La fecha/hora FIN debe ser posterior al INICIO.'; msg.className = 'msg err'; return null; }
+    if (e - s > 7 * DAY) { msg.textContent = '⚠ Supera 1 semana. ¿Estás seguro?'; msg.className = 'msg warn'; }
+    else msg.textContent = '';
     return { startDate: s.toISOString(), endDate: e.toISOString() };
   }
 
   document.querySelectorAll('.presets button').forEach(b => b.addEventListener('click', () => {
     let start;
-    if (b.dataset.start === 'week') {
-      // Lunes de esta semana (si hoy es domingo, el lunes es hace 6 días)
-      start = now.getDay() === 0 ? off(-6) : off(1 - now.getDay());
-    } else {
-      start = off(Number(b.dataset.start));
-    }
+    if (b.dataset.start === 'week') start = now.getDay() === 0 ? off(-6) : off(1 - now.getDay());
+    else start = off(Number(b.dataset.start));
     $('startDate').value = fmt(start);
     $('endDate').value = fmt(off(Number(b.dataset.end)));
     validate();
   }));
-
-  ['startDate', 'endDate', 'startTime', 'endTime'].forEach(id => $(id).addEventListener('change', validate));
+  ['startDate','endDate','startTime','endTime'].forEach(id => $(id).addEventListener('change', validate));
 
   $('go').addEventListener('click', async () => {
     const range = validate();
     if (!range) return;
-    $('go').disabled = true;
-    $('go').textContent = 'Enviando...';
+    $('go').disabled = true; $('go').textContent = 'Enviando...';
     try {
-      const r = await fetch('/submit', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(range),
-      });
+      const r = await fetch('/submit', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(range) });
       const j = await r.json();
-      if (j.ok) {
-        $('msg').textContent = '✅ ¡Listo! Podés cerrar esta pestaña y volver a la terminal.';
-        $('msg').className = 'msg ok';
-        $('go').textContent = '✓ Enviado';
-      } else {
-        $('msg').textContent = '❌ ' + j.error;
-        $('msg').className = 'msg err';
-        $('go').disabled = false;
-        $('go').textContent = '▶ EMPEZAR EXTRACCIÓN';
+      if (!j.ok) {
+        $('msg').textContent = '❌ ' + j.error; $('msg').className = 'msg err';
+        $('go').disabled = false; $('go').textContent = '▶ EMPEZAR EXTRACCIÓN';
+        return;
       }
     } catch {
       $('msg').textContent = '❌ No se pudo contactar la aplicación. ¿Se cerró la terminal?';
       $('msg').className = 'msg err';
-      $('go').disabled = false;
-      $('go').textContent = '▶ EMPEZAR EXTRACCIÓN';
+      $('go').disabled = false; $('go').textContent = '▶ EMPEZAR EXTRACCIÓN';
+      return;
     }
+    // Cambiar a fase estado
+    $('rangePhase').classList.add('hidden');
+    $('statusPhase').classList.remove('hidden');
+    $('subtitle').textContent = 'Extrayendo comprobantes…';
   });
+
+  // ── Estado en vivo (SSE) ──
+  const log = $('log');
+  function appendLog(line) {
+    const div = document.createElement('div');
+    div.textContent = line;
+    log.appendChild(div);
+    while (log.childNodes.length > 500) log.removeChild(log.firstChild);
+    log.scrollTop = log.scrollHeight;
+  }
+  function setBadge(text, cls) {
+    const b = $('phaseBadge');
+    b.textContent = text;
+    b.className = 'badge ' + cls;
+  }
+
+  const es = new EventSource('/events');
+  es.addEventListener('log', e => {
+    appendLog(JSON.parse(e.data));
+    setBadge('trabajando…', 'live');
+  });
+  es.addEventListener('qr', e => {
+    $('qrImg').src = JSON.parse(e.data);
+    $('qrbox').classList.remove('hidden');
+    setBadge('esperando escaneo del QR', 'wait');
+    appendLog('🔳 QR recibido — escanealo con WhatsApp');
+  });
+  es.addEventListener('file', e => {
+    const f = JSON.parse(e.data);
+    $('fname').textContent = f.name;
+    $('fsize').textContent = (f.size / 1024).toFixed(1) + ' KB — guardado en la carpeta de la app';
+    $('fileready').classList.remove('hidden');
+    setBadge('✅ proceso finalizado', 'live');
+    appendLog('📄 ' + f.name + ' listo (' + (f.size/1024).toFixed(1) + ' KB)');
+  });
+  es.onopen = () => setBadge('conectado', 'live');
+  es.onerror = () => setBadge('reconectando…', 'wait');
 </script>
 </body>
 </html>
@@ -182,115 +241,202 @@ function openBrowser(url) {
   }
 }
 
+function sseSend(res, event, data) {
+  res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+}
+
 /**
- * Levanta el servidor del picker. No abre el navegador (eso lo hace
- * askDateRangeWeb) — así los tests pueden ejercitar los endpoints sin UI.
+ * Levanta el servidor de control. NO abre el navegador (eso lo hace index.js
+ * con handle.openBrowser()) para que los tests puedan ejercitar todo sin UI.
  *
- * @param {Function} onSubmit  (range) => void  — se llama con el rango validado
- * @returns {Promise<{server, port, url, close}>}
+ * Devuelve un handle con:
+ *   server, port, url, close()
+ *   waitForRange(timeoutMs) → Promise<{startDate, endDate}>  (Date)
+ *   pushLog(line)        — línea de log → página
+ *   sendQR(qr)           — string QR → imagen PNG en la página
+ *   notifyFile(filePath) — marca el Word como listo + habilita /download
+ *   attachConsole()      — tee de console.log/error hacia la página
+ *   openBrowser()        — abre el navegador con la página
  */
-function createPickerServer(onSubmit) {
+function startControlServer() {
   return new Promise((resolve, reject) => {
+    const handle = {
+      server: null,
+      fileInfo: null,          // { name, size, path }
+      events: [],              // buffer de replay { event, data }
+      clients: new Set(),      // res SSE activos
+      _range: null,            // rango ya recibido
+      _waiters: [],            // resolvers de waitForRange pendientes
+      _dlWaiters: [],          // resolvers de waitForDownload pendientes
+      _downloads: 0,           // veces que se descargó el archivo
+    };
+
+    function emit(event, data) {
+      handle.events.push({ event, data });
+      if (handle.events.length > EVENT_BUFFER_MAX) handle.events.shift();
+      for (const res of handle.clients) {
+        try { sseSend(res, event, data); }
+        catch { handle.clients.delete(res); }
+      }
+    }
+
+    handle.pushLog = (line) => emit('log', String(line));
+    handle.sendQR = (qr) => {
+      QRCode.toDataURL(qr, { width: 300, margin: 1 })
+        .then(dataUrl => emit('qr', dataUrl))
+        .catch(() => { /* si falla la imagen, el QR sigue en terminal */ });
+    };
+    handle.notifyFile = (filePath) => {
+      try {
+        const stat = fs.statSync(filePath);
+        handle.fileInfo = { name: path.basename(filePath), size: stat.size, path: filePath };
+        emit('file', { name: handle.fileInfo.name, size: handle.fileInfo.size });
+      } catch {
+        handle.pushLog('⚠ No se pudo leer el archivo generado: ' + filePath);
+      }
+    };
+
+    /**
+     * Espera a que el usuario descargue el archivo (o hasta timeout).
+     * Devuelve 'downloaded' o 'timeout'. Mantiene el servidor vivo mientras tanto —
+     * es lo que evita el clásico "comprobá tu conexión" por matar el proceso
+     * antes de que el navegador descargue.
+     */
+    handle.waitForDownloadOrTimeout = (timeoutMs = 300_000) => new Promise(resolve => {
+      if (handle._downloads > 0) { resolve('downloaded'); return; }
+      const timer = setTimeout(() => {
+        handle._dlWaiters = handle._dlWaiters.filter(w => w !== done);
+        resolve('timeout');
+      }, timeoutMs);
+      const done = (r) => { clearTimeout(timer); resolve(r); };
+      handle._dlWaiters.push(done);
+    });
+
+    handle.waitForRange = (timeoutMs = PICKER_TIMEOUT_MS) => new Promise((resolveRange, rejectRange) => {
+      if (handle._range) { resolveRange(handle._range); return; }
+      const timer = setTimeout(() => {
+        rejectRange(new Error(
+          `Tiempo de espera agotado (${Math.round(timeoutMs / 60_000)} min) sin recibir rango en el navegador.\n` +
+          '   Ejecutá de nuevo, o usá el modo terminal:  node index.js --terminal'
+        ));
+      }, timeoutMs);
+      handle._waiters.push((range) => { clearTimeout(timer); resolveRange(range); });
+    });
+
+    // Tee de la consola → página (solo una vez por proceso)
+    let consoleAttached = false;
+    handle.attachConsole = () => {
+      if (consoleAttached) return;
+      consoleAttached = true;
+      const origLog = console.log.bind(console);
+      const origError = console.error.bind(console);
+      console.log = (...a) => { origLog(...a); try { emit('log', a.map(String).join(' ')); } catch {} };
+      console.error = (...a) => { origError(...a); try { emit('log', a.map(String).join(' ')); } catch {} };
+    };
+
+    handle.openBrowser = () => openBrowser(handle.url);
+
+    handle.close = () => new Promise(r => {
+      for (const res of handle.clients) { try { res.end(); } catch {} }
+      handle.clients.clear();
+      if (handle.server) handle.server.close(() => r());
+      else r();
+    });
+
     const server = http.createServer((req, res) => {
+      // Página
       if (req.method === 'GET' && req.url === '/') {
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
         res.end(PAGE_HTML);
         return;
       }
 
+      // Estado en vivo (SSE)
+      if (req.method === 'GET' && req.url === '/events') {
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream; charset=utf-8',
+          'Cache-Control': 'no-cache',
+          Connection: 'keep-alive',
+        });
+        res.write(': conectado\n\n');
+        // Replay del buffer: clientes que se conectan tarde no pierden nada
+        for (const e of handle.events) {
+          try { sseSend(res, e.event, e.data); } catch { break; }
+        }
+        handle.clients.add(res);
+        const ka = setInterval(() => { try { res.write(': ping\n\n'); } catch {} }, SSE_KEEPALIVE_MS);
+        req.on('close', () => { handle.clients.delete(res); clearInterval(ka); });
+        return;
+      }
+
+      // Rango (autoritativo)
       if (req.method === 'POST' && req.url === '/submit') {
         let body = '';
         req.on('data', c => { body += c; });
         req.on('end', () => {
           let range;
-          try {
-            range = JSON.parse(body);
-          } catch {
-            send(res, 400, { ok: false, error: 'JSON inválido.' });
-            return;
-          }
+          try { range = JSON.parse(body); }
+          catch { sendJson(res, 400, { ok: false, error: 'JSON inválido.' }); return; }
 
           const startDate = new Date(range?.startDate);
           const endDate = new Date(range?.endDate);
-
           if (isNaN(startDate) || isNaN(endDate)) {
-            send(res, 400, { ok: false, error: 'Fechas inválidas.' });
-            return;
+            sendJson(res, 400, { ok: false, error: 'Fechas inválidas.' }); return;
           }
           if (endDate <= startDate) {
-            send(res, 400, { ok: false, error: 'La fecha/hora FIN debe ser posterior al INICIO.' });
-            return;
+            sendJson(res, 400, { ok: false, error: 'La fecha/hora FIN debe ser posterior al INICIO.' }); return;
           }
 
-          send(res, 200, { ok: true });
-          try { onSubmit({ startDate, endDate }); } catch { /* noop */ }
-          server.close();
+          sendJson(res, 200, { ok: true });
+          handle._range = { startDate, endDate };
+          const waiters = handle._waiters;
+          handle._waiters = [];
+          waiters.forEach(w => w(handle._range));
+          handle.pushLog(`📅 Rango recibido: ${startDate.toLocaleString('es-CO')} → ${endDate.toLocaleString('es-CO')}`);
         });
         return;
       }
 
-      send(res, 404, { ok: false, error: 'No encontrado.' });
+      // Descarga del Word generado
+      if (req.method === 'GET' && req.url === '/download') {
+        if (!handle.fileInfo) {
+          sendJson(res, 404, { ok: false, error: 'Todavía no se generó el archivo.' }); return;
+        }
+        fs.readFile(handle.fileInfo.path, (err, buf) => {
+          if (err) { sendJson(res, 404, { ok: false, error: 'Archivo no disponible.' }); return; }
+          res.writeHead(200, {
+            'Content-Type': DOCX_MIME,
+            'Content-Disposition': `attachment; filename="${handle.fileInfo.name}"`,
+            'Content-Length': buf.length,
+          });
+          res.end(buf);
+          handle._downloads += 1;
+          // Despertar a quienes esperan la descarga
+          const waiters = handle._dlWaiters;
+          handle._dlWaiters = [];
+          waiters.forEach(w => w('downloaded'));
+        });
+        return;
+      }
+
+      sendJson(res, 404, { ok: false, error: 'No encontrado.' });
     });
 
     server.on('error', reject);
     server.listen(0, '127.0.0.1', () => {
       const { port } = server.address();
-      resolve({
-        server,
-        port,
-        url: `http://127.0.0.1:${port}/`,
-        close: () => new Promise(r => server.close(() => r())),
-      });
+      handle.server = server;
+      handle.port = port;
+      handle.url = `http://127.0.0.1:${port}/`;
+      server.unref(); // no mantener vivo el proceso al terminar
+      resolve(handle);
     });
   });
 }
 
-function send(res, code, obj) {
+function sendJson(res, code, obj) {
   res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify(obj));
 }
 
-/**
- * Flujo completo para index.js: servidor + navegador + espera del rango.
- * Devuelve { startDate, endDate } como Date. Lanza error si el usuario
- * no responde en PICKER_TIMEOUT_MS.
- */
-async function askDateRangeWeb(timeoutMs = PICKER_TIMEOUT_MS) {
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    let serverRef = null;
-    const settle = (fn, v) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      fn(v);
-    };
-
-    createPickerServer((range) => {
-      const summary =
-        `   📅 INICIO : ${range.startDate.toLocaleString('es-CO')}\n` +
-        `   📅 FIN    : ${range.endDate.toLocaleString('es-CO')}`;
-      console.log(`\n✅ Rango recibido:\n${summary}\n`);
-      settle(resolve, range);
-    }).then(({ url, close }) => {
-      serverRef = close;
-      console.log('\n══════════════════════════════════════════════════════');
-      console.log('  📅 SELECTOR DE FECHAS — se abrió el navegador');
-      console.log('══════════════════════════════════════════════════════');
-      console.log(`  Si no se abrió, entrá a: ${url}`);
-      console.log('  Elegí el rango y tocá "EMPEZAR EXTRACCIÓN".\n');
-      openBrowser(url);
-    }).catch(err => settle(reject, err));
-
-    const timer = setTimeout(() => {
-      // Cerrar el servidor para que el proceso no quede colgado escuchando
-      if (serverRef) serverRef();
-      settle(reject, new Error(
-        `Tiempo de espera agotado (${Math.round(timeoutMs / 60_000)} min) sin recibir rango en el navegador.\n` +
-        '   Ejecutá de nuevo, o usá el modo terminal:  node index.js --terminal'
-      ));
-    }, timeoutMs);
-  });
-}
-
-module.exports = { createPickerServer, askDateRangeWeb, openBrowser };
+module.exports = { startControlServer, openBrowser };
