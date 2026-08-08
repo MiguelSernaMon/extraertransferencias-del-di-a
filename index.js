@@ -699,7 +699,8 @@ function collectMessages(sock, groupJid, startTs, endTs, options = {}) {
       const existing = collected.get(msg.key.id);
       // Preferir la copia CON participant (los upsert en vivo la traen; las
       // copias del history sync pueden venir sin ella en sesiones nuevas)
-      if (!existing || (msg.key?.participant && !existing.key?.participant)) {
+      const hasSender = m => m?.key?.participant || m?.participant;
+      if (!existing || (!hasSender(existing) && hasSender(msg))) {
         collected.set(msg.key.id, msg);
         process.stdout.write(`\r  📨 Comprobantes encontrados: ${collected.size}   `);
       }
@@ -979,7 +980,7 @@ async function phase1_downloadFromCdn(messages, concurrency = 2) {
         continue;
       }
 
-      if (!msg.key?.participant) senderDiag.sin++;
+      if (!(msg.key?.participant || msg.participant)) senderDiag.sin++;
       else senderDiag.con++;
       if (msg.key?.fromMe) senderDiag.propios++;
 
@@ -1045,7 +1046,7 @@ async function phase2_reuploadExpired(sock, expiredMessages) {
         msg.message?.documentMessage?.mimetype ?? '';
 
       if (mimetype.startsWith('image/')) {
-        if (!msg.key?.participant) senderDiag.sin++;
+        if (!(msg.key?.participant || msg.participant)) senderDiag.sin++;
         else senderDiag.con++;
         if (msg.key?.fromMe) senderDiag.propios++;
 
@@ -1165,11 +1166,15 @@ async function downloadAllTwoPhase(messages, sock) {
 // 7. NOMBRE DEL REMITENTE
 // ════════════════════════════════════════════════════════════════════════════
 function getSenderName(msg, contacts) {
+  // El remitente puede venir en key.participant (normal) o en el campo
+  // top-level `participant` (algunos syncs en Windows lo mandan ahí).
+  const participant = msg.key?.participant || msg.participant;
+
   // Sin participant (history sync): el pushName limpio puede identificar al
   // remitente; si no hay, es mensaje propio → nombre propio (nunca el grupo).
-  if (!msg.key?.participant) return cleanPushName(msg.pushName) || ownName || 'YO';
+  if (!participant) return cleanPushName(msg.pushName) || ownName || 'YO';
 
-  const jid = msg.key.participant ?? msg.key.remoteJid;
+  const jid = participant;
 
   // 1. Buscar en nombres manuales (archivo nombres_mensajeros.json)
   //    El jid puede ser un LID → convertir a teléfono → buscar nombre manual
