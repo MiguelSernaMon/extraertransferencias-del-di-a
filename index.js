@@ -190,6 +190,14 @@ const contactsMap = {};
 // Todo nombre sospechoso de ser el grupo se descarta (daría filas con el
 // nombre del grupo para todos los mensajeros en Windows/sesiones nuevas).
 let knownGroupName = '';
+// Nombre del dueño de la sesión: los mensajes propios (fromMe) no traen
+// participant en history sync → antes caían a remoteJid = jid del GRUPO
+// ("MENSAJERO: 120363192583651767"). Con esto salen con tu nombre.
+let ownName = 'YO';
+
+// Lista de participantes para el panel web (mapeo de IDs → nombres)
+let participantList = [];
+const participantLids = new Set();
 
 /** true si el nombre parece ser el del grupo (pushName envenenado). */
 function isGroupNameLike(name) {
@@ -1106,12 +1114,18 @@ async function downloadAllTwoPhase(messages, sock) {
 // 7. NOMBRE DEL REMITENTE
 // ════════════════════════════════════════════════════════════════════════════
 function getSenderName(msg, contacts) {
+  // Mensaje propio o sin remitente identificable (participant es obligatorio
+  // para mensajes de otros miembros): remoteJid sería el GRUPO → nombre propio.
+  if (!msg.key?.participant) return ownName || 'YO';
+
   const jid = msg.key.participant ?? msg.key.remoteJid;
 
   // 1. Buscar en nombres manuales (archivo nombres_mensajeros.json)
   //    El jid puede ser un LID → convertir a teléfono → buscar nombre manual
   const phone = lidToPhone[jid] || jid.split('@')[0];
   if (manualNames[phone]) return manualNames[phone];
+  //    También admitir entradas con clave LID directa (remitentes sin teléfono)
+  if (manualNames[jid]) return manualNames[jid];
 
   // 2. Buscar en contactos sincronizados y caché (nunca el nombre del grupo)
   const c = contacts[jid] || contactsMap[jid];
@@ -1128,6 +1142,30 @@ function getSenderName(msg, contacts) {
   return phone;
 }
 
+// ── Archivo de nombres (v2: también persiste el mapeo LID → teléfono) ───────
+// El mapeo vivo sale de la metadata del grupo; persistirlo en el mismo JSON
+// hace que funcione también en máquinas donde la metadata no trae teléfonos
+// (sesiones nuevas, como en Windows).
+function loadManualNames() {
+  const { data, corrupt } = loadJSONFile(NOMBRES_FILE);
+  if (corrupt) {
+    console.log('⚠  nombres_mensajeros.json estaba dañado. Se respaldó el archivo original');
+    console.log('   — tus nombres siguen en el respaldo y se pueden restaurar manualmente.');
+  }
+  const obj = (data && typeof data === 'object') ? data : {};
+  for (const [k, v] of Object.entries(obj)) {
+    if (k === '_lid_to_phone' && v && typeof v === 'object') {
+      Object.assign(lidToPhone, v);
+    } else if (typeof v === 'string') {
+      manualNames[k] = v;
+    }
+  }
+}
+
+function saveManualNames() {
+  atomicWriteFileSync(NOMBRES_FILE, JSON.stringify({ ...manualNames, _lid_to_phone: lidToPhone }, null, 2));
+}
+
 async function reconnectWithRetries(maxRetries, phaseLabel) {
   let sock;
 
@@ -1138,6 +1176,7 @@ async function reconnectWithRetries(maxRetries, phaseLabel) {
     const result = await waitForOpen(sock);
     if (result === 'open') {
       currentSock = sock;
+      ownName = sock.user?.name?.trim() || 'YO';
       backupSessionSnapshot(); // sesión OK → respaldo para recuperar sin reescanear QR
       return sock;
     }
@@ -1169,6 +1208,13 @@ async function main() {
     activePicker.attachConsole();   // tee de la consola → página (en vivo)
     activePicker.openBrowser();
     console.log(`📡 Panel abierto en el navegador (${activePicker.url})`);
+    // Guardar nombres asignados desde el panel → archivo + mapa en vivo
+    activePicker.setNameSaver((key, name) => {
+      if (name) manualNames[key] = name;
+      else delete manualNames[key];
+      try { saveManualNames(); }
+      catch (err) { activePicker.pushLog('⚠ No se pudo guardar nombres: ' + err.message); }
+    });
   }
   const { startDate, endDate } = useWebPicker
     ? await activePicker.waitForRange()
@@ -1193,12 +1239,22 @@ async function main() {
 
   let groupJid = await findGroupJid(sock);
 
-  // ── Obtener participantes y construir mapeo LID → teléfono ────────────────
+  // ── Participantes: mapeo LID → teléfono + nombres para el panel web ───────
+  let metadata = null;
   try {
-    const metadata = await sock.groupMetadata(groupJid);
+    metadata = await sock.groupMetadata(groupJid);
     knownGroupName = metadata.subject || knownGroupName;
 
-    // Construir mapeo LID → teléfono desde metadata del grupo
+    // Traer contactos de la agenda YA (los nombres reales resuelven solos
+    // los remitentes guardados; en sesiones nuevas puede llegar tarde o nunca)
+    try { if (typeof sock.fetchContacts === 'function') await sock.fetchContacts(); } catch { /* opcional */ }
+  } catch (err) {
+    console.log(`  ⚠ No se pudo obtener metadata del grupo: ${err.message}`);
+  }
+
+  if (metadata) {
+    // Primero el mapeo persistido del archivo, después el fresco de metadata
+    loadManualNames();
     for (const p of metadata.participants) {
       const phoneLid = p.lid || p.id;
       const phoneJid = p.jid || p.id;
@@ -1209,52 +1265,48 @@ async function main() {
       if (p.id) lidToPhone[p.id] = phoneNum;
     }
 
-    // Generar/actualizar archivo de nombres manuales
-    if (fs.existsSync(NOMBRES_FILE)) {
-      // Cargar nombres existentes (si el archivo está dañado, se respalda y avisa)
-      const { data: existingNames, corrupt } = loadJSONFile(NOMBRES_FILE);
-      if (corrupt) {
-        console.log('⚠  nombres_mensajeros.json estaba dañado. Se respaldó el archivo original');
-        console.log('   — tus nombres siguen en el respaldo y se pueden restaurar manualmente.');
-      }
-      if (existingNames && typeof existingNames === 'object') {
-        Object.assign(manualNames, existingNames);
-      }
-
-      // Agregar nuevos participantes que no estén en el archivo
-      let newEntries = 0;
-      for (const p of metadata.participants) {
-        const phoneNum = (p.jid || p.id).split('@')[0];
-        if (!manualNames[phoneNum]) {
-          manualNames[phoneNum] = '';
-          newEntries++;
-        }
-      }
-      if (newEntries > 0) {
-        atomicWriteFileSync(NOMBRES_FILE, JSON.stringify(manualNames, null, 2));
-        console.log(`   📝 ${newEntries} nuevos participantes agregados al archivo de nombres`);
-      }
-    } else {
-      // Primera vez: crear archivo con todos los participantes
-      for (const p of metadata.participants) {
-        const phoneNum = (p.jid || p.id).split('@')[0];
+    // Entradas vacías para participantes nuevos (el panel permite nombrarlos)
+    let newEntries = 0;
+    for (const p of metadata.participants) {
+      const phoneNum = (p.jid || p.id).split('@')[0];
+      if (!manualNames[phoneNum] && !manualNames[p.id] && !manualNames[p.id?.split('@')[0]]) {
         manualNames[phoneNum] = '';
+        newEntries++;
       }
-      atomicWriteFileSync(NOMBRES_FILE, JSON.stringify(manualNames, null, 2));
+    }
+    const firstRun = !fs.existsSync(NOMBRES_FILE);
+    if (firstRun || newEntries > 0) saveManualNames();
+
+    if (firstRun) {
       console.log(`\n  ╔══════════════════════════════════════════════════════╗`);
       console.log(`  ║  📋 ARCHIVO DE NOMBRES CREADO                        ║`);
       console.log(`  ║                                                      ║`);
-      console.log(`  ║  Abre: nombres_mensajeros.json                       ║`);
-      console.log(`  ║  Pon el nombre de cada mensajero junto a su número.  ║`);
-      console.log(`  ║  Ejemplo: "573001234567": "JUAN PÉREZ"                ║`);
+      console.log(`  ║  Asigná los nombres desde el panel web (👥 Mensajeros)║`);
+      console.log(`  ║  o editando: nombres_mensajeros.json                 ║`);
       console.log(`  ╚══════════════════════════════════════════════════════╝\n`);
+    } else if (newEntries > 0) {
+      console.log(`   📝 ${newEntries} nuevos participantes agregados al archivo de nombres`);
     }
 
     // Contar nombres asignados
     const assigned = Object.values(manualNames).filter(n => n).length;
     console.log(`👥 Participantes: ${metadata.participants.length}, nombres asignados: ${assigned}/${Object.keys(manualNames).length}`);
-  } catch (err) {
-    console.log(`  ⚠ No se pudo obtener metadata del grupo: ${err.message}`);
+
+    // Panel web: lista de participantes para mapear IDs → nombres
+    participantList = metadata.participants.map(p => {
+      const lid = p.lid || p.id;
+      const phone = p.jid ? p.jid.split('@')[0] : null;
+      participantLids.add(lid);
+      return {
+        lid,
+        phone,
+        name: manualNames[phone] || manualNames[lid] || manualNames[lid?.split('@')[0]] || '',
+      };
+    });
+    if (activePicker) activePicker.setParticipants(participantList);
+  } else {
+    // Sin metadata: cargar igual lo persistido para que el mapeo siga funcionando
+    loadManualNames();
   }
 
   console.log('⏳ Esperando sincronización de historial...');
@@ -1292,6 +1344,25 @@ async function main() {
       console.log('⚡ Activando sincronización rápida (hay caché previa en el rango).\n');
     }
     collection = await collectMessages(sock, groupJid, startTs, endTs, collectOptions);
+  }
+
+  // Sumar al panel los remitentes que ya no están en la metadata del grupo
+  if (activePicker && msgStore.size > 0) {
+    let added = 0;
+    for (const msg of msgStore.values()) {
+      const lid = msg.key?.participant;
+      if (lid && !participantLids.has(lid)) {
+        participantLids.add(lid);
+        const phone = lidToPhone[lid] || null;
+        participantList.push({
+          lid,
+          phone,
+          name: manualNames[phone] || manualNames[lid] || manualNames[lid.split('@')[0]] || '',
+        });
+        added++;
+      }
+    }
+    if (added > 0) activePicker.setParticipants(participantList);
   }
 
   let healAttempt = 0;
@@ -1601,9 +1672,18 @@ module.exports = {
   tryRestoreSessionSnapshot,
   _setBadMacCount: n => { badMacTracker.count = n; }, // hook solo para tests
   _setKnownGroupName: n => { knownGroupName = n; },   // hook solo para tests
+  _setOwnName: n => { ownName = n; },                 // hook solo para tests
   _setManualName: (phone, name) => { manualNames[phone] = name; }, // hook solo para tests
   _setLidToPhone: (lid, phone) => { lidToPhone[lid] = phone; },    // hook solo para tests
   cleanPushName,
   isGroupNameLike,
   getSenderName,
+  loadManualNames,
+  saveManualNames,
+  _resetNamesState: () => {
+    Object.keys(manualNames).forEach(k => delete manualNames[k]);
+    Object.keys(lidToPhone).forEach(k => delete lidToPhone[k]);
+    participantList = [];
+    participantLids.clear();
+  }, // hook solo para tests
 };

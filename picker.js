@@ -81,6 +81,25 @@ const PAGE_HTML = `<!DOCTYPE html>
   .badge { display:inline-block; font-size:11px; font-weight:600; padding:3px 10px; border-radius:12px; }
   .badge.wait { background:#fef3c7; color:#8a6d1a; }
   .badge.live { background:#dcfce7; color:#166534; }
+  .mapcard { margin-top:16px; border:1px solid var(--borde); border-radius:8px; padding:12px 14px; }
+  .maphead { display:flex; align-items:center; justify-content:space-between; margin-bottom:2px; }
+  .maphead h3 { margin:0; font-size:14px; color:var(--azul); }
+  .maphead button { border:1px solid var(--borde); background:#fff; color:#234; padding:5px 12px;
+                    border-radius:16px; cursor:pointer; font-size:12px; }
+  .maphead button:hover { border-color:var(--azul); color:var(--azul); }
+  .mapsub { font-size:11px; color:#889; margin:4px 0 10px; }
+  .maplist { max-height:300px; overflow-y:auto; }
+  .maprow { display:grid; grid-template-columns:1fr 1.2fr auto; gap:8px; align-items:center; margin-bottom:8px; }
+  .maprow input { width:100%; padding:7px 9px; border:1px solid var(--borde); border-radius:6px;
+                  font-size:13px; font-family:inherit; }
+  .maprow input:focus { outline:2px solid rgba(0,51,153,.25); border-color:var(--azul); }
+  .mapid b { font-size:12px; color:#345; }
+  .mapid .mapidsub { display:block; font-size:10px; color:#99a; }
+  .mapsave { background:var(--azul); color:#fff; border:0; padding:7px 12px; border-radius:6px;
+             font-size:12px; cursor:pointer; font-family:inherit; }
+  .mapsave:hover { background:#002a7d; } .mapsave:disabled { background:#9db4d8; cursor:default; }
+  .mapbtn { margin-top:6px; width:auto; padding:9px 18px; font-size:13px; }
+  .mapempty { font-size:12px; color:#889; padding:8px 0; }
 </style>
 </head>
 <body>
@@ -129,6 +148,17 @@ const PAGE_HTML = `<!DOCTYPE html>
       <div class="fname" id="fname"></div>
       <div class="fsize" id="fsize"></div>
       <a class="dl" id="dl" href="/download" download>⬇ Descargar Word</a>
+    </div>
+
+    <!-- FASE 3: mapear mensajeros (IDs → nombres) -->
+    <div class="mapcard hidden" id="mapcard">
+      <div class="maphead">
+        <h3>👥 Mensajeros del grupo</h3>
+        <button id="mapRefresh">Actualizar</button>
+      </div>
+      <p class="mapsub">Poné el nombre de cada mensajero — se guarda al instante en nombres_mensajeros.json y se aplica a este reporte.</p>
+      <div class="maplist" id="maplist"></div>
+      <button class="btn mapbtn" id="mapSaveAll">💾 Guardar todos</button>
     </div>
   </div>
 </div>
@@ -224,8 +254,98 @@ const PAGE_HTML = `<!DOCTYPE html>
     setBadge('✅ proceso finalizado', 'live');
     appendLog('📄 ' + f.name + ' listo (' + (f.size/1024).toFixed(1) + ' KB)');
   });
+  es.addEventListener('participants', e => {
+    $('mapcard').classList.remove('hidden');
+    renderMap(JSON.parse(e.data));
+  });
   es.onopen = () => setBadge('conectado', 'live');
   es.onerror = () => setBadge('reconectando…', 'wait');
+
+  // ── Mapeo de mensajeros: IDs → nombres ──
+  const mapList = $('maplist');
+  function renderMap(list) {
+    mapList.innerHTML = '';
+    if (!list || !list.length) {
+      const div = document.createElement('div');
+      div.className = 'mapempty';
+      div.textContent = 'Aún no hay datos del grupo…';
+      mapList.appendChild(div);
+      return;
+    }
+    for (const p of list) {
+      const row = document.createElement('div');
+      row.className = 'maprow';
+
+      const idText = document.createElement('div');
+      idText.className = 'mapid';
+      const main = p.phone || (p.lid || '').replace('@lid', '');
+      const sub = (p.phone && p.lid) ? p.lid.replace('@lid', '') : '';
+      const b = document.createElement('b');
+      b.textContent = main;          // solo números (teléfono/LID) — sin innerHTML
+      idText.appendChild(b);
+      if (sub) {
+        const s = document.createElement('span');
+        s.className = 'mapidsub';
+        s.textContent = sub;
+        idText.appendChild(s);
+      }
+
+      const inp = document.createElement('input');
+      inp.type = 'text';
+      inp.placeholder = 'Nombre del mensajero…';
+      inp.value = p.name || '';
+      inp.dataset.key = p.phone || p.lid || '';
+
+      const btn = document.createElement('button');
+      btn.textContent = 'Guardar';
+      btn.className = 'mapsave';
+      btn.onclick = () => saveName(inp, btn);
+      inp.onkeydown = e => { if (e.key === 'Enter') saveName(inp, btn); };
+
+      row.appendChild(idText); row.appendChild(inp); row.appendChild(btn);
+      mapList.appendChild(row);
+    }
+  }
+  async function saveName(inp, btn) {
+    const name = inp.value.trim();
+    btn.disabled = true; btn.textContent = '…';
+    try {
+      const r = await fetch('/api/names', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ key: inp.dataset.key, name }),
+      });
+      const j = await r.json();
+      if (j.ok) { btn.textContent = '✓'; }
+      else { appendLog('⚠ No se guardó: ' + j.error); btn.textContent = 'Guardar'; }
+      setTimeout(() => { btn.textContent = 'Guardar'; btn.disabled = false; }, 800);
+    } catch {
+      btn.textContent = 'Guardar'; btn.disabled = false;
+      appendLog('⚠ No se pudo guardar el nombre');
+    }
+  }
+  $('mapSaveAll').addEventListener('click', async () => {
+    const inputs = [...document.querySelectorAll('.maprow input')];
+    let okCount = 0;
+    for (const inp of inputs) {
+      const name = inp.value.trim();
+      if (!name) continue;
+      try {
+        const r = await fetch('/api/names', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ key: inp.dataset.key, name }),
+        });
+        if (r.ok) okCount++;
+      } catch { /* seguir con el resto */ }
+    }
+    appendLog('💾 ' + okCount + ' nombres guardados');
+  });
+  $('mapRefresh').addEventListener('click', async () => {
+    try {
+      const r = await fetch('/api/participants');
+      const j = await r.json();
+      if (j.ok) renderMap(j.participants);
+    } catch { /* la página se actualiza sola por SSE */ }
+  });
 </script>
 </body>
 </html>
@@ -269,6 +389,8 @@ function startControlServer() {
       _waiters: [],            // resolvers de waitForRange pendientes
       _dlWaiters: [],          // resolvers de waitForDownload pendientes
       _downloads: 0,           // veces que se descargó el archivo
+      _participants: [],       // lista para mapear nombres { lid, phone, name }
+      _nameSaver: null,        // callback (key, name) → persiste en index.js
     };
 
     function emit(event, data) {
@@ -311,6 +433,14 @@ function startControlServer() {
       const done = (r) => { clearTimeout(timer); resolve(r); };
       handle._dlWaiters.push(done);
     });
+
+    // Lista de participantes del grupo (para mapear IDs → nombres en la página)
+    handle.setParticipants = (list) => {
+      handle._participants = list || [];
+      emit('participants', handle._participants);
+    };
+    // Callback para persistir un nombre asignado (lo implementa index.js)
+    handle.setNameSaver = (cb) => { handle._nameSaver = cb; };
 
     handle.waitForRange = (timeoutMs = PICKER_TIMEOUT_MS) => new Promise((resolveRange, rejectRange) => {
       if (handle._range) { resolveRange(handle._range); return; }
@@ -393,6 +523,31 @@ function startControlServer() {
           handle._waiters = [];
           waiters.forEach(w => w(handle._range));
           handle.pushLog(`📅 Rango recibido: ${startDate.toLocaleString('es-CO')} → ${endDate.toLocaleString('es-CO')}`);
+        });
+        return;
+      }
+
+      // Lista de participantes (para mapear IDs → nombres)
+      if (req.method === 'GET' && req.url === '/api/participants') {
+        sendJson(res, 200, { ok: true, participants: handle._participants || [] });
+        return;
+      }
+
+      // Guardar el nombre de un mensajero (persiste index.js en el JSON)
+      if (req.method === 'POST' && req.url === '/api/names') {
+        let body = '';
+        req.on('data', c => { body += c; });
+        req.on('end', () => {
+          let data;
+          try { data = JSON.parse(body); } catch { sendJson(res, 400, { ok: false, error: 'JSON inválido.' }); return; }
+          const key = String(data?.key || '').trim();
+          const name = String(data?.name || '').trim();
+          if (!key) { sendJson(res, 400, { ok: false, error: 'Falta el identificador.' }); return; }
+          if (!handle._nameSaver) { sendJson(res, 500, { ok: false, error: 'La aplicación aún no conectó.' }); return; }
+          try { handle._nameSaver(key, name); }
+          catch (err) { sendJson(res, 500, { ok: false, error: err.message }); return; }
+          handle.pushLog(`👤 Mensajero ${key} → ${name || '(sin nombre)'}`);
+          sendJson(res, 200, { ok: true });
         });
         return;
       }
