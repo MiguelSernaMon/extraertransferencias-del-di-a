@@ -12,6 +12,7 @@
  */
 
 const fs     = require('fs');
+const path   = require('path');
 const QRCode = require('qrcode');
 const { prompt } = require('enquirer');
 const pino = require('pino');
@@ -53,6 +54,10 @@ const SYNC_IDLE_MS_NORMAL = 30_000;
 const SYNC_IDLE_MS_FAST = 10_000;
 const SYNC_GLOBAL_MS_NORMAL = 180_000;
 const SYNC_GLOBAL_MS_FAST = 60_000;
+// Si el sync no comenzó, la notificación del historial puede tardar (el
+// servidor la dispara cuando el teléfono sube su historial): esperar hasta
+// 2 min por el primer chunk antes de rendirse.
+const SYNC_WAIT_FIRST_CHUNK_MS = 120_000;
 const FAILED_CACHE_FILE = './failed_downloads.json';
 const MEDIA_CACHE_DIR   = './media_cache';
 const MAX_CONCURRENT_DOWNLOADS = 2;
@@ -611,6 +616,14 @@ function toUnix(ts) {
   return Number(ts);
 }
 
+/** Guardia de fecha: ¿el mensaje pertenece al rango seleccionado?
+ *  Se aplica además del filtro upstream como defensa en profundidad:
+ *  NINGUNA imagen fuera del rango puede descargarse ni exportarse. */
+function isMsgInRange(msg, startTs, endTs) {
+  const ts = toUnix(msg?.messageTimestamp);
+  return ts > 0 && ts >= startTs && ts <= endTs;
+}
+
 function collectMessages(sock, groupJid, startTs, endTs, options = {}) {
   return new Promise(resolve => {
     const idleMs = options.idleMs ?? SYNC_IDLE_MS_NORMAL;
@@ -624,10 +637,13 @@ function collectMessages(sock, groupJid, startTs, endTs, options = {}) {
     let totalMsgsReceived = 0;
     let totalGroupMsgs = 0;
     let oldestGroupTsSeen = Number.MAX_SAFE_INTEGER;
+    let sawAnyChunk = false; // llegó al menos un chunk/upsert (sync comenzó)
+    let finishReason = 'unknown'; // por qué se cerró el sync (diagnóstico de huecos)
 
-    const finish = () => {
+    const finish = (why = 'idle') => {
       if (finished) return;
       finished = true;
+      finishReason = why;
       clearTimeout(idleTimer);
       clearTimeout(globalTimer);
       sock.ev.off('messaging-history.set', onHistory);
@@ -649,7 +665,7 @@ function collectMessages(sock, groupJid, startTs, endTs, options = {}) {
         console.log(`  📦 ${fromStore} comprobantes adicionales encontrados en caché local.`);
       }
 
-      console.log(`\n  📈 Debug: ${historyChunks} chunks de historial, ${totalMsgsReceived} mensajes totales recibidos, ${totalGroupMsgs} del grupo`);
+      console.log(`\n  📈 Debug: ${historyChunks} chunks de historial, ${totalMsgsReceived} mensajes totales recibidos, ${totalGroupMsgs} del grupo (fin: ${finishReason})`);
       resolve({
         messages: [...collected.values()],
         stats: {
@@ -657,17 +673,26 @@ function collectMessages(sock, groupJid, startTs, endTs, options = {}) {
           totalMsgsReceived,
           totalGroupMsgs,
           totalCollected: collected.size,
+          finishReason,
         }
       });
     };
 
     const resetIdle = () => {
       clearTimeout(idleTimer);
-      // Espera adaptativa: normal o rápida si ya hay buen caché local
+      // Espera adaptativa: normal o rápida si ya hay buen caché local.
+      // Si el sync NO comenzó (0 chunks), la notificación del servidor puede
+      // tardar en llegar (propagación del historial del teléfono): esperar
+      // mucho más antes de rendirse en vez de abortar con "0 comprobantes".
       idleTimer = setTimeout(() => {
+        if (!sawAnyChunk) {
+          process.stdout.write('\n  ⏳ Sin notificación de historial aún — siguiendo esperando (el servidor puede tardar)...\n');
+          resetIdle();
+          return;
+        }
         process.stdout.write('\n  ⏱ Sin más mensajes entrantes. Continuando...\n');
-        finish();
-      }, idleMs);
+        finish('idle');
+      }, sawAnyChunk ? idleMs : SYNC_WAIT_FIRST_CHUNK_MS);
     };
 
     const isMedia = msg =>
@@ -707,16 +732,23 @@ function collectMessages(sock, groupJid, startTs, endTs, options = {}) {
     };
 
     const onHistory = ({ messages: msgs, isLatest }) => {
+      sawAnyChunk = true;
       historyChunks++;
       console.log(`  📥 Chunk de historial #${historyChunks}: ${msgs.length} mensajes (isLatest=${isLatest})`);
       msgs.forEach(m => addMsg(m, 'history'));
 
       // Corte temprano: si ya llegamos a mensajes anteriores al inicio del rango,
       // no hace falta seguir sincronizando todo el historial.
-      if (oldestGroupTsSeen < startTs) {
-        process.stdout.write('\n  ⚡ Ya alcanzamos mensajes más viejos que el inicio del rango. Cerrando sincronización anticipadamente...\n');
+      // PERO solo es seguro cuando ya vimos mensajes en rango (o el sync terminó):
+      // en un delta sync el PRIMER chunk puede traer mensajes viejos y los nuevos
+      // llegan después — cerrar acá los descartaría ("0 comprobantes en el rango"
+      // con mensajes existiendo). Ordenar por remoteJid+id y orden del stream.
+      if (isLatest || (collected.size > 0 && oldestGroupTsSeen < startTs)) {
+        process.stdout.write(isLatest
+          ? '\n  ✅ Historial sincronizado.\n'
+          : '\n  ⚡ Ya alcanzamos mensajes más viejos que el inicio del rango. Cerrando sincronización anticipadamente...\n');
         clearTimeout(idleTimer);
-        idleTimer = setTimeout(finish, 2_500);
+        idleTimer = setTimeout(() => finish('earlyExit'), 2_500);
         return;
       }
 
@@ -725,12 +757,13 @@ function collectMessages(sock, groupJid, startTs, endTs, options = {}) {
         process.stdout.write('\n  ✅ Historial sincronizado.\n');
         clearTimeout(idleTimer);
         // Esperar 8s después de "isLatest" por si llegan más chunks
-        idleTimer = setTimeout(finish, 8_000);
+        idleTimer = setTimeout(() => finish('isLatest'), 8_000);
       }
     };
 
     const onUpsert = ({ messages: msgs, type }) => {
       // Procesar TODOS los tipos: 'notify' (tiempo real) y 'append' (históricos)
+      sawAnyChunk = true;
       console.log(`  📬 Upsert: ${msgs.length} mensajes, type=${type}`);
       msgs.forEach(m => addMsg(m, `upsert-${type}`));
       if (type === 'append') resetIdle();
@@ -742,7 +775,7 @@ function collectMessages(sock, groupJid, startTs, endTs, options = {}) {
     // Tiempo máximo: 3 minutos (antes eran 2)
     globalTimer = setTimeout(() => {
       process.stdout.write('\n  ⏱ Tiempo máximo alcanzado.\n');
-      finish();
+      finish('global');
     }, globalMs);
 
     resetIdle();
@@ -907,7 +940,7 @@ async function downloadWithReupload(sock, msg, timeoutMs = 40_000) {
 }
 
 // ── FASE 1: Descarga masiva desde CDN (concurrente, sin re-upload) ───────────
-async function phase1_downloadFromCdn(messages, concurrency = 2) {
+async function phase1_downloadFromCdn(messages, concurrency = 2, startTs, endTs) {
   const failedDownloads = loadFailedDownloads();
   const total = messages.length;
   const receipts = [];
@@ -944,6 +977,18 @@ async function phase1_downloadFromCdn(messages, concurrency = 2) {
 
       // Saltar fallos permanentes previos
       if (failedDownloads.has(msgKeyId)) {
+        stats.failed++;
+        completed++;
+        writeProgress();
+        continue;
+      }
+
+      // GUARDIA DE FECHA: jamás descargar una imagen fuera del rango elegido.
+      // El filtro upstream ya aplica, pero si algo se cuela (caché viejo,
+      // sync raro, versión desactualizada), aquí se detiene antes de tocar
+      // el CDN o el disco — "no pueden salir las del día pasado".
+      if (!isMsgInRange(msg, startTs, endTs)) {
+        stats.skippedDate = (stats.skippedDate || 0) + 1;
         stats.failed++;
         completed++;
         writeProgress();
@@ -1013,7 +1058,7 @@ async function phase1_downloadFromCdn(messages, concurrency = 2) {
 // ── FASE 2: Re-upload serial (UNO POR UNO, delays largos) ───────────────────
 // Respeta a WhatsApp: un solo worker, 25-35s entre cada solicitud,
 // imita a un humano reintentando manualmente.
-async function phase2_reuploadExpired(sock, expiredMessages) {
+async function phase2_reuploadExpired(sock, expiredMessages, startTs, endTs) {
   const total = expiredMessages.length;
   if (total === 0) return { receipts: [], stats: { ok: 0, failed: 0, permanent: 0 } };
 
@@ -1028,6 +1073,13 @@ async function phase2_reuploadExpired(sock, expiredMessages) {
     const msg = expiredMessages[i];
     const msgKeyId = msg.key?.id || `unknown-${i}`;
     const shortId = msgKeyId.slice(0, 14);
+
+    // GUARDIA DE FECHA (misma que fase 1): sin ella, un mensaje fuera de rango
+    // podría recuperarse vía re-upload y colarse al Word final.
+    if (!isMsgInRange(msg, startTs, endTs)) {
+      stats.skippedDate = (stats.skippedDate || 0) + 1;
+      continue;
+    }
 
     // Saltar fallos permanentes previos
     if (failedDownloads.has(msgKeyId)) {
@@ -1095,7 +1147,7 @@ async function phase2_reuploadExpired(sock, expiredMessages) {
 }
 
 // ── Orquestador de dos fases ─────────────────────────────────────────────────
-async function downloadAllTwoPhase(messages, sock) {
+async function downloadAllTwoPhase(messages, sock, startTs, endTs) {
   const failedDownloads = loadFailedDownloads();
 
   // Fase 1: CDN directo, concurrente, sin re-upload
@@ -1104,7 +1156,7 @@ async function downloadAllTwoPhase(messages, sock) {
   console.log(`║  Sin solicitar re-upload al remitente                    ║`);
   console.log(`╚══════════════════════════════════════════════════════════╝\n`);
 
-  const phase1 = await phase1_downloadFromCdn(messages, MAX_CONCURRENT_DOWNLOADS);
+  const phase1 = await phase1_downloadFromCdn(messages, MAX_CONCURRENT_DOWNLOADS, startTs, endTs);
 
   console.log(`\n  📊 Fase 1 completada:`);
   console.log(`     ✅ CDN / caché : ${phase1.stats.ok + phase1.stats.fromCache}`);
@@ -1118,7 +1170,7 @@ async function downloadAllTwoPhase(messages, sock) {
     console.log(`║  Imitando comportamiento humano para evitar baneo       ║`);
     console.log(`╚══════════════════════════════════════════════════════════╝`);
 
-    const phase2 = await phase2_reuploadExpired(sock, phase1.expiredMessages);
+    const phase2 = await phase2_reuploadExpired(sock, phase1.expiredMessages, startTs, endTs);
 
     console.log(`  📊 Fase 2 completada:`);
     console.log(`     ✅ Recuperados  : ${phase2.stats.ok}`);
@@ -1222,6 +1274,63 @@ function saveManualNames() {
   atomicWriteFileSync(NOMBRES_FILE, JSON.stringify({ ...manualNames, _lid_to_phone: lidToPhone }, null, 2));
 }
 
+/** Limpia el recibo de historial de creds.json (processedHistoryMessages).
+ *  Al reconectar, baileys trata el sync como primera vez y el servidor
+ *  reenvía el historial completo. NO invalida la sesión: mismo teléfono,
+ *  sin QR. Devuelve true si había algo que limpiar.
+ *  credsPath se puede inyectar para pruebas. */
+async function clearHistoryReceipt(credsPath = path.join(AUTH_FOLDER, 'creds.json')) {
+  try {
+    const { data } = loadJSONFile(credsPath);
+    if (data && Array.isArray(data.processedHistoryMessages) && data.processedHistoryMessages.length > 0) {
+      data.processedHistoryMessages = [];
+      atomicWriteFileSync(credsPath, JSON.stringify(data));
+      return true;
+    }
+  } catch { /* creds inaccesible → no se puede limpiar */ }
+  return false;
+}
+
+/** Evidencia de sync CORTADO: ≥3 días seguidos sin mensajes, flanqueados por
+ *  días CON mensajes (el servidor tenía el historial, el sync anterior se
+ *  cerró antes de entregarlo). El flanco tolera hasta 3 días de distancia
+ *  (un corte puede llevarse también días lindantes). Días legítimos en
+ *  silencio → false. */
+function findGapEvidence(cacheCoveredDays, startTs, endTs) {
+  const DAY_MS = 86_400_000;
+  const dayOf = (ms) => new Date(ms).toISOString().slice(0, 10);
+  const coveredInWindow = (fromDay, toDay) => {
+    let t = new Date(fromDay + 'T00:00:00Z').getTime();
+    const end = new Date(toDay + 'T00:00:00Z').getTime();
+    for (; t <= end; t += DAY_MS) {
+      if (cacheCoveredDays.has(dayOf(t))) return true;
+    }
+    return false;
+  };
+  let run = 0, runStart = null, runEnd = null;
+  const checkRun = () => {
+    if (run >= 3 && runStart && runEnd) {
+      const s = new Date(runStart + 'T00:00:00Z').getTime();
+      const e = new Date(runEnd + 'T00:00:00Z').getTime();
+      return coveredInWindow(dayOf(s - 3 * DAY_MS), dayOf(s - DAY_MS))
+          && coveredInWindow(dayOf(e + DAY_MS), dayOf(e + 3 * DAY_MS));
+    }
+    return false;
+  };
+  for (let dt = startTs; dt <= endTs; dt += 86_400) {
+    const day = dayOf(dt * 1000);
+    if (!cacheCoveredDays.has(day)) {
+      if (run === 0) runStart = day;
+      run++;
+      runEnd = day;
+    } else {
+      if (checkRun()) return true;
+      run = 0; runStart = null; runEnd = null;
+    }
+  }
+  return checkRun(); // corrida que termina al final del rango
+}
+
 async function reconnectWithRetries(maxRetries, phaseLabel) {
   let sock;
 
@@ -1279,6 +1388,12 @@ async function main() {
     : await askDateRange();
   const startTs = Math.floor(startDate.getTime() / 1000);
   const endTs   = Math.floor(endDate.getTime()   / 1000);
+
+  // Borrar el Word de corridas anteriores al arrancar: si este proceso muere
+  // a mitad (p. ej. se cierra la ventana durante la fase de re-uploads), el
+  // archivo viejo del día pasado NO puede quedar para confundir con un
+  // resultado nuevo ("me volvieron a salir las del día anterior").
+  try { fs.rmSync(OUTPUT_FILE, { force: true }); } catch { /* si no existe, ok */ }
 
   // ── Cargar cachés de ejecuciones previas ─────────────────────────────────
   loadNameCache();
@@ -1462,6 +1577,64 @@ async function main() {
     collection = await collectMessages(sock, groupJid, startTs, endTs);
   }
 
+  // ── Sync vacío: recuperación automática, sin intervención ─────────────────
+  // El servidor no envió la notificación de historial (baileys espera 20s y
+  // pasa Online sin mensajes) → "0 comprobantes" con mensajes existiendo.
+  // Recuperación en 2 pasos:
+  //   (1) Limpiar el recibo de historial y reconectar: el servidor reenvía
+  //       TODO el historial. No invalida la sesión (sin QR).
+  //   (2) Si sigue vacío y el rango ya pasó: respaldar la sesión (nunca se
+  //       borra sin backup) y renovarla — aparece el QR, y la nueva sesión
+  //       sincroniza el historial completo.
+  if (
+    collection.stats.totalGroupMsgs === 0 &&
+    previousCacheStats.inRange === 0
+  ) {
+    console.log('\n⚠ La sincronización no recibió mensajes del grupo.');
+    console.log('   Intentando recuperación automática...\n');
+
+    // Paso 1 — no destructivo: pedir historial completo al servidor
+    if (await clearHistoryReceipt()) {
+      console.log('   (1/2) Recibo de historial limpiado — reconectando para sincronizar TODO...');
+      try { await sock.end(); } catch { /* ignorar */ }
+      sock = await reconnectWithRetries(
+        AUTO_HEAL_CONNECT_RETRIES,
+        'Reintentando con historial completo'
+      );
+      groupJid = await findGroupJid(sock);
+      sock.ev.on('connection.update', onClose);
+      collection = await collectMessages(sock, groupJid, startTs, endTs);
+      console.log(`   Sync tras limpiar recibo: ${collection.stats.totalGroupMsgs} mensajes del grupo.`);
+    }
+
+    // Paso 2 — destructivo con respaldo: renovar sesión (QR).
+    // Solo si el rango es pasado: recuperar días futuros/con hoy no tiene
+    // sentido aún (el historial puede estar todavía en el teléfono).
+    if (collection.stats.totalGroupMsgs === 0 && endTs <= Math.floor(Date.now() / 1000) - 3600) {
+      console.log('   (2/2) La sesión no sincroniza. Respaldando y renovando sesión — escaneá el QR cuando aparezca...');
+      const backup = `${AUTH_FOLDER}_backup_${Date.now()}`;
+      try {
+        fs.renameSync(AUTH_FOLDER, backup);
+        console.log(`   📦 Sesión anterior respaldada en: ${backup}`);
+      } catch { /* si no existe, no hay nada que respaldar */ }
+      msgStore.clear();
+      try { await sock.end(); } catch { /* ignorar */ }
+      sock = await reconnectWithRetries(
+        AUTO_HEAL_CONNECT_RETRIES,
+        'Conectando con sesión nueva (QR)'
+      );
+      groupJid = await findGroupJid(sock);
+      sock.ev.on('connection.update', onClose);
+      collection = await collectMessages(sock, groupJid, startTs, endTs);
+      console.log(`   Sync con sesión nueva: ${collection.stats.totalGroupMsgs} mensajes del grupo.`);
+    }
+
+    if (collection.stats.totalGroupMsgs === 0) {
+      console.log('   ⚠ La recuperación no obtuvo mensajes. Continuando con el caché local disponible.');
+      console.log('   💡 Si persiste: revisá el QR arriba (si apareció), cerrá y volvé a ejecutar.\n');
+    }
+  }
+
   sock.ev.off('connection.update', onClose);
 
   // ── Guardar TODOS los mensajes nuevos al caché persistente ────────────────
@@ -1506,12 +1679,96 @@ async function main() {
 
   console.log(`📊 Total comprobantes en el rango: ${rawMsgs.length}`);
 
+  // ── Detectar días del rango sin comprobantes ─────────────────────────────
+  // Un sync cortado en una corrida anterior (early-exit viejo) deja días
+  // enteros sin caché; el delta del servidor no reenvía lo cortado.
+  let missingDays = [];
+  if (rawMsgs.length > 0) {
+    const covered = new Set();
+    for (const msg of rawMsgs) {
+      covered.add(new Date(toUnix(msg.messageTimestamp) * 1000).toISOString().slice(0, 10));
+    }
+    for (let dt = startTs; dt <= endTs; dt += 86_400) {
+      const day = new Date(dt * 1000).toISOString().slice(0, 10);
+      if (!covered.has(day)) missingDays.push(day.slice(5));
+    }
+    if (missingDays.length > 0) {
+      console.log(`⚠ Días del rango sin comprobantes: ${missingDays.join(', ')}`);
+    }
+  }
+
+  // ── Recuperación automática de sync cortado ──────────────────────────────
+  // Señal de corte: ≥3 días seguidos SIN mensajes en el caché, flanqueados
+  // por días CON mensajes (el servidor tenía el historial, pero el sync
+  // anterior se cerró antes de entregarlo — el delta no reenvía lo cortado).
+  // Días legítimos en silencio no disparan nada (sin flancos con mensajes).
+  // Recuperación NO destructiva: limpiar recibo de historial → reconectar →
+  // resync completo (misma sesión, sin QR).
+  const cacheCoveredDays = new Set();
+  for (const [, msg] of allCached) {
+    cacheCoveredDays.add(new Date(toUnix(msg.messageTimestamp) * 1000).toISOString().slice(0, 10));
+  }
+
+  if (missingDays.length > 0) {
+    if (findGapEvidence(cacheCoveredDays, startTs, endTs)) {
+      console.log('   📐 Señal de sync cortado: hueco de días consecutivos flanqueado por días con mensajes.');
+      console.log('   ♻  Recuperando automáticamente: limpiando recibo de historial y resincronizando (sin borrar sesión)...\n');
+      if (await clearHistoryReceipt()) {
+        try { await sock.end(); } catch { /* ignorar */ }
+        sock = await reconnectWithRetries(AUTO_HEAL_CONNECT_RETRIES, 'Resincronizando historial completo');
+        groupJid = await findGroupJid(sock);
+        sock.ev.on('connection.update', onClose);
+        const recovered = await collectMessages(sock, groupJid, startTs, endTs);
+        sock.ev.off('connection.update', onClose);
+        const merged = saveCachedGroupMessages(groupJid, msgStore);
+
+        // Reconstruir el filtro con el caché actualizado
+        rawMsgs.length = 0;
+        for (const [, msg] of merged) {
+          const ts = toUnix(msg.messageTimestamp);
+          if (ts >= startTs && ts <= endTs) rawMsgs.push(msg);
+        }
+        rawMsgs.sort((a, b) => toUnix(a.messageTimestamp) - toUnix(b.messageTimestamp));
+        console.log(`📊 Total comprobantes tras recuperación: ${rawMsgs.length} (el sync trajo ${recovered.stats.totalGroupMsgs} mensajes del grupo)`);
+
+        missingDays = [];
+        const covered2 = new Set();
+        for (const msg of rawMsgs) {
+          covered2.add(new Date(toUnix(msg.messageTimestamp) * 1000).toISOString().slice(0, 10));
+        }
+        for (let dt = startTs; dt <= endTs; dt += 86_400) {
+          const day = new Date(dt * 1000).toISOString().slice(0, 10);
+          if (!covered2.has(day)) missingDays.push(day.slice(5));
+        }
+        if (missingDays.length > 0) {
+          console.log(`⚠ Aún faltan días (el servidor no los reenvía): ${missingDays.join(', ')}`);
+          console.log('   Para recuperarlos: borrá "baileys_auth" y escaneá el QR (a veces el teléfono reenvía el historial más tarde).\n');
+        } else {
+          console.log('   ✅ Recuperación completa: ya no faltan días.\n');
+        }
+      } else {
+        console.log('   ⚠ El recibo ya estaba limpio (se limpió en una corrida anterior) y los días siguen faltando.');
+        console.log('   Para recuperarlos: borrá "baileys_auth" y escaneá el QR (a veces el teléfono reenvía el historial más tarde).\n');
+      }
+    } else {
+      console.log('   (Días legítimos en silencio, o sync cortado de una corrida anterior:');
+      console.log('   el servidor no reenvía lo cortado. Para el historial completo: borrá "baileys_auth" y escaneá el QR.)\n');
+    }
+  }
+
   if (rawMsgs.length === 0) {
     console.log('\n⚠  No se encontraron imágenes en el rango seleccionado.');
-    console.log('   Si es la primera vez que usas la app, los mensajes');
-    console.log('   se guardaron en caché y estarán disponibles en');
-    console.log('   las próximas ejecuciones.');
-    console.log('   El sistema intentó autorrepararse; si persiste, vuelve a ejecutar y espera 1-2 minutos extra de sincronización.\n');
+    if (collection.stats.totalGroupMsgs === 0 && previousCacheStats.inRange === 0) {
+      console.log('   La sincronización no trajo NINGÚN mensaje del grupo (ver mensajes de sync arriba).');
+      console.log('   Es problema de conexión/sync, no de fechas. Ejecutá de nuevo;');
+      console.log('   si persiste, borrá la carpeta "baileys_auth" y escaneá el QR.');
+    } else {
+      console.log('   Si es la primera vez que usas la app, los mensajes');
+      console.log('   se guardaron en caché y estarán disponibles en');
+      console.log('   las próximas ejecuciones.');
+      console.log('   El sistema intentó autorrepararse; si persiste, vuelve a ejecutar y espera 1-2 minutos extra de sincronización.');
+    }
+    console.log();
     if (activePicker) activePicker.pushLog('⚠ No se encontraron comprobantes en el rango seleccionado.');
     try { await sock.end(); } catch { /* ignore */ }
     await flushPickerBeforeExit();
@@ -1524,7 +1781,7 @@ async function main() {
     console.log(`📦 ${cacheHits} imágenes ya en caché local`);
   }
 
-  const { receipts, stats: dlStats } = await downloadAllTwoPhase(rawMsgs, sock);
+  const { receipts, stats: dlStats } = await downloadAllTwoPhase(rawMsgs, sock, startTs, endTs);
 
   // ── Resumen de descargas ────────────────────────────────────────────────
   console.log(`\n${'─'.repeat(55)}`);
@@ -1537,6 +1794,7 @@ async function main() {
   console.log(`  ❌ No disponibles      : ${dlStats.reuploadFailed}`);
   console.log(`  🚫 Otros fallos        : ${dlStats.failed}`);
   console.log(`  ✅ Imágenes válidas    : ${receipts.length}`);
+  if (dlStats.skippedDate) console.log(`  🛡 Fuera del rango fecha: ${dlStats.skippedDate} (bloqueados)`);
   console.log(`${'─'.repeat(55)}\n`);
 
   try { await sock.end(); } catch { /* ignore */ }
@@ -1738,7 +1996,11 @@ module.exports = {
   _setLidToPhone: (lid, phone) => { lidToPhone[lid] = phone; },    // hook solo para tests
   cleanPushName,
   isGroupNameLike,
+  isMsgInRange,
   getSenderName,
+  createWordDocument,
+  clearHistoryReceipt,
+  findGapEvidence,
   loadManualNames,
   saveManualNames,
   pushEarlyParticipants,
