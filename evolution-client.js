@@ -163,27 +163,31 @@ async function checkInstance() {
   return { found: true, status: inst.connectionStatus || inst.status || 'unknown' };
 }
 
-/** Inicia sesión/QR de la instancia (desde el panel). Devuelve la data cruda
- *  ({qrcode: {code, base64}, pairingCode, ...}) o { error } si falla. El panel
- *  muestra el QR y la terminal/panel reflejan el estado al conectar. */
-async function connectInstance() {
+/** Lista de instancias existentes en Evolution (para el selector del panel).
+ *  Contrato real de este server: GET /instance/fetchInstances → array con
+ *  {name, connectionStatus, number (número de la SIM), ownerJid, ...}. */
+async function listInstances() {
   try {
-    return await apiRequest('POST', `/instance/connect/${config.instance}`);
+    const data = await apiRequest('GET', '/instance/fetchInstances');
+    const list = Array.isArray(data) ? data : [];
+    return list.map(i => ({
+      name: i.name || i.instanceName || '',
+      status: i.connectionStatus || i.status || 'unknown',
+      number: i.number || (i.ownerJid || '').split('@')[0] || '',
+    }));
   } catch (err) {
     return { error: err.message };
   }
 }
 
-/** Crea la instancia en Evolution y devuelve su QR — enlaza el número nuevo
- *  desde el panel cuando la instancia no existe (ej. tras borrar el número
- *  viejo del VPS). Contrato v2: POST /instance/create/{instance} con body
- *  {createWithQr: true}; devuelve {instance, qrcode: {code, base64}, ...}.
- *  Si el server ignora el body y no trae qrcode, se cierra con connect. */
-async function createInstance() {
+/** Inicia sesión/QR de la instancia (desde el panel). Contrato REAL de este
+ *  server (v2.3.x): GET /instance/connect/{instance} → {code, base64, ...}
+ *  con el PNG del QR en base64 a nivel top. POST devuelve 404 ("Cannot POST").
+ *  Normaliza a {qrcode: {code, base64}} — el shape que espera el panel. */
+async function connectInstance() {
   try {
-    const data = await apiRequest('POST', `/instance/create/${config.instance}`, { createWithQr: true });
-    if (data?.qrcode) return data;
-    return await connectInstance();
+    const data = await apiRequest('GET', `/instance/connect/${config.instance}`);
+    return { qrcode: { code: data?.code || '', base64: data?.base64 || '' } };
   } catch (err) {
     return { error: err.message };
   }
@@ -241,7 +245,7 @@ module.exports = {
   downloadMedia,
   checkInstance,
   connectInstance,
-  createInstance,
+  listInstances,
   normalizeRecord,
   toSeconds,
   apiRequest,

@@ -181,7 +181,7 @@ const PAGE_HTML = `<!DOCTYPE html>
         <input type="text" id="cfgUrl" placeholder="https://transferencias.redpostal.co">
       </label>
       <label>Instancia de Evolution
-        <input type="text" id="cfgInstance" placeholder="Personal">
+        <select id="cfgInstance"><option value="">cargando…</option></select>
       </label>
       <label>Nombre del grupo
         <input type="text" id="cfgGroup" placeholder="transferencias">
@@ -400,14 +400,44 @@ const PAGE_HTML = `<!DOCTYPE html>
     }
   }
   (async function loadCfg() {
+    const instSel = $('cfgInstance');
     try {
       const r = await fetch('/api/config');
       const j = await r.json();
       if (j.ok) {
         $('cfgUrl').value = j.evolutionUrl || '';
-        $('cfgInstance').value = j.instance || '';
         $('cfgGroup').value = j.groupName || '';
         $('cfgKey').placeholder = j.hasApiKey ? '••••••••  (dejar en blanco = mantener)' : 'API key (obligatoria)';
+        // Selector: instancias existentes en Evolution + la configurada
+        try {
+          const ri = await fetch('/api/instances');
+          const ji = await ri.json();
+          const opts = ji.instances || [];
+          instSel.innerHTML = '';
+          if (j.instance) {
+            const cur = document.createElement('option');
+            cur.value = j.instance; cur.textContent = j.instance + ' (configurada)';
+            instSel.appendChild(cur);
+          }
+          for (const i of opts) {
+            if (i.name && i.name !== j.instance) {
+              const o = document.createElement('option');
+              o.value = i.name; o.textContent = i.name + (i.status === 'open' ? ' ✓' : (i.number ? ' — ' + i.number : ''));
+              instSel.appendChild(o);
+            }
+          }
+          if (opts.length === 0 && !j.instance) {
+            const e = document.createElement('option');
+            e.value = ''; e.textContent = '(sin instancias — creala en Evolution)';
+            instSel.appendChild(e);
+          }
+        } catch {
+          // sin lista → dejar el valor actual como opción única
+          instSel.innerHTML = '';
+          const cur = document.createElement('option');
+          cur.value = j.instance || ''; cur.textContent = j.instance || '(sin instancia)';
+          instSel.appendChild(cur);
+        }
       }
     } catch { /* la app puede no estar lista aún */ }
   })();
@@ -576,6 +606,7 @@ function startControlServer() {
     // Conexión: proveedor de estado / conector QR / callback post-config
     handle.setInstanceChecker = (fn) => { handle._instanceChecker = fn; };
     handle.setConnector = (fn) => { handle._connector = fn; };
+    handle.setInstanceLister = (fn) => { handle._instanceLister = fn; };
     handle.setConfigApplied = (fn) => { handle._configApplied = fn; };
 
     handle.waitForRange = (timeoutMs = PICKER_TIMEOUT_MS) => new Promise((resolveRange, rejectRange) => {
@@ -694,6 +725,15 @@ function startControlServer() {
           handle.pushLog(`⚙ Conexión guardada (instancia: ${next.instance})`);
           sendJson(res, 200, { ok: true, instance: next.instance });
         });
+        return;
+      }
+
+      // Instancias existentes en Evolution (selector del panel)
+      if (req.method === 'GET' && req.url === '/api/instances') {
+        if (!handle._instanceLister) { sendJson(res, 200, { ok: true, instances: [] }); return; }
+        Promise.resolve(handle._instanceLister())
+          .then(list => sendJson(res, 200, { ok: true, instances: list || [] }))
+          .catch(() => sendJson(res, 200, { ok: true, instances: [] }));
         return;
       }
 
