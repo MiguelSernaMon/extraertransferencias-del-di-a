@@ -1997,6 +1997,7 @@ module.exports = {
   cleanPushName,
   isGroupNameLike,
   isMsgInRange,
+  toUnix,
   getSenderName,
   createWordDocument,
   clearHistoryReceipt,
