@@ -1222,9 +1222,31 @@ function getSenderName(msg, contacts) {
   // top-level `participant` (algunos syncs en Windows lo mandan ahí).
   const participant = msg.key?.participant || msg.participant;
 
-  // Sin participant (history sync): el pushName limpio puede identificar al
-  // remitente; si no hay, es mensaje propio → nombre propio (nunca el grupo).
-  if (!participant) return cleanPushName(msg.pushName) || ownName || 'YO';
+  // Sin participant: el pushName limpio puede identificar al remitente; si no
+  // hay, es mensaje propio → nombre propio (nunca el grupo).
+  if (!participant) {
+    const pn = cleanPushName(msg.pushName);
+    // Evolution (findMessages v2.3.x) NO manda participant en los records — el
+    // único rastro del remitente es pushName = ECO del lid (puro dígitos, ej.
+    // "139217120301203"). Ese eco NO es un nombre: se resuelve lid → puente
+    // lidToPhone → teléfono → nombre manual / contacto. (Si el puente falla,
+    // queda el número crudo, igual que la rama con participant.)
+    if (pn && /^\d+$/.test(pn)) {
+      const lid = `${pn}@lid`;
+      const phone = lidToPhone[lid] || pn;
+      if (manualNames[phone]) return manualNames[phone];
+      if (manualNames[lid]) return manualNames[lid];
+      if (manualNames[pn]) return manualNames[pn];
+      const c = contacts[lid] || contactsMap[lid] ||
+        contacts[`${phone}@s.whatsapp.net`] || contactsMap[`${phone}@s.whatsapp.net`];
+      const cached = nameCache.get(lid) || nameCache.get(phone);
+      const name = c?.name || c?.verifiedName ||
+        (cached && !isGroupNameLike(cached) ? cached : null) || cleanPushName(c?.notify);
+      if (name) return name;
+      return phone;
+    }
+    return pn || ownName || 'YO';
+  }
 
   const jid = participant;
 
