@@ -115,6 +115,21 @@ async function listGroups() {
     .map(g => ({ id: g.id || g.jid, subject: g.subject || g.name || '' }));
 }
 
+/** Miembros de un grupo: [{id (lid), phoneNumber, admin}]. fetchAllGroups exige
+ *  ?getParticipants=true (sin el param → 400). El phoneNumber es el puente
+ *  lid→teléfono que usa el pipeline para resolver nombres. Fail-soft: [] si
+ *  falla la llamada o el grupo no aparece. */
+async function fetchGroupMembers(groupJid) {
+  try {
+    const data = await apiRequest('GET', `/group/fetchAllGroups/${config.instance}?getParticipants=true`);
+    const list = Array.isArray(data) ? data : [];
+    const g = list.find(x => x.id === groupJid);
+    return g?.participants || [];
+  } catch {
+    return [];
+  }
+}
+
 /** Contactos: { '<jid>': { name } } — jid completo como lo devuelve Evolution.
  *  Contrato real: es POST /chat/findContacts/{instance} (GET → 404) y el body
  *  SIEMPRE lleva {take: 500} — body vacío crashea el contenedor (connection
@@ -187,6 +202,7 @@ async function downloadMedia(msg) {
 
 module.exports = {
   listGroups,
+  fetchGroupMembers,
   findContactsMap,
   findMediaMessages,
   downloadMedia,

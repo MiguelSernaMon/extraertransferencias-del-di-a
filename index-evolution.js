@@ -22,11 +22,91 @@ const { startControlServer } = require('./picker');
 const OUTPUT_FILE = 'Comprobantes_Descargados.docx';
 const MEDIA_CACHE_DIR = './media_cache';
 const CACHE_FILE = './group_cache.json';
+const NOMBRES_FILE = './nombres_mensajeros.json';
 
 const CONCURRENCY = 2;
 const RETRIES = 3;
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// Estado para el panel de mapeo (miembros + contactos del último run)
+let currentMembers = [];
+let currentContacts = {};
+
+/** Entries para el panel de mapeo: lids vistos en el caché + miembros del grupo
+ *  (lid → teléfono) + nombres manuales/contactos ya resueltos. El mapper de
+ *  picker.js pide [{lid, phone, name}] — mismo shape de senderToEntry (index.js). */
+function buildParticipantEntries() {
+  const entries = new Map();
+  // 1. Remitentes del caché local (lids, sin esperar API)
+  try {
+    const cache = M.loadCachedGroupMessages();
+    for (const [, m] of cache) {
+      const lid = m.key?.participant;
+      if (lid && lid.endsWith('@lid')) entries.set(lid, { lid, phone: null, name: '' });
+    }
+  } catch { /* caché aún no existe */ }
+  // 2. Miembros del grupo: lid → teléfono + nombre de contacto
+  for (const m of currentMembers) {
+    const e = entries.get(m.id) || { lid: m.id, phone: null, name: '' };
+    e.phone = m.phoneNumber || e.phone;
+    if (currentContacts[m.id]?.name) e.name = currentContacts[m.id].name;
+    entries.set(m.id, e);
+  }
+  // 3. Nombres manuales del archivo (senderToEntry usa manualNames del módulo)
+  return [...entries.values()].map(e => {
+    const entry = M.senderToEntry(e.lid, e.phone);
+    return { lid: e.lid, phone: e.phone, name: entry.name || e.name };
+  });
+}
+
+/** Persiste el puente lid→teléfono en _lid_to_phone del archivo de nombres
+ *  (mismo formato que saveManualNames de index.js). El mapeo vivo que en
+ *  baileys llenaba la metadata del grupo acá sale de fetchGroupMembers:
+ *  persistirlo hace que nombres guardados bajo NÚMERO (formato legacy y del
+ *  panel) matcheen a remitentes que llegan como lid (getSenderName resuelve
+ *  lid → teléfono vía lidToPhone). Devuelve true si cambió algo. */
+function persistLidBridge(members) {
+  let map = {};
+  try {
+    const d = JSON.parse(fs.readFileSync(NOMBRES_FILE, 'utf8'));
+    if (d && !Array.isArray(d)) map = d;
+  } catch { /* archivo nuevo */ }
+  const lidPhone = map._lid_to_phone || {};
+  let changed = false;
+  for (const m of members || []) {
+    const bare = (m.phoneNumber || '').replace('@s.whatsapp.net', '');
+    if (m.id && bare && lidPhone[m.id] !== bare) { lidPhone[m.id] = bare; changed = true; }
+  }
+  if (changed) {
+    atomicWriteFileSync(NOMBRES_FILE, JSON.stringify({ ...map, _lid_to_phone: lidPhone }, null, 2));
+    M.loadManualNames(); // refresca lidToPhone del módulo para getSenderName
+  }
+  return changed;
+}
+
+/** Persiste un nombre manual con el MISMO formato de saveManualNames (index.js):
+ *  {...manualNames, _lid_to_phone} y refresca el mapa interno del módulo para
+ *  que getSenderName lo use en la misma corrida. El panel manda key = teléfono
+ *  o lid: se normaliza a número crudo (getSenderName consulta manualNames con
+ *  el número sin sufijo) y el puente lid→teléfono se aplica a los miembros
+ *  que usan ese número. */
+function saveManualName(key, name) {
+  let map = {};
+  try {
+    const d = JSON.parse(fs.readFileSync(NOMBRES_FILE, 'utf8'));
+    if (d && !Array.isArray(d)) map = d;
+  } catch { /* archivo nuevo */ }
+  const bare = String(key).replace('@s.whatsapp.net', '');
+  if (name) map[bare] = name;
+  else delete map[bare];
+  const lidPhone = map._lid_to_phone || {};
+  for (const m of currentMembers) {
+    if (m.id && (m.phoneNumber || '').replace('@s.whatsapp.net', '') === bare) lidPhone[m.id] = bare;
+  }
+  atomicWriteFileSync(NOMBRES_FILE, JSON.stringify({ ...map, _lid_to_phone: lidPhone }, null, 2));
+  M.loadManualNames(); // refresh del mapa interno (getSenderName)
+}
 
 /** Pool de descarga con concurrencia fija (mismo patrón que la fase 1 heredada). */
 async function downloadQueue(items, worker, concurrency) {
@@ -45,10 +125,11 @@ async function downloadQueue(items, worker, concurrency) {
 
 /**
  * Pipeline principal (exportado para tests; main() solo agrega el picker).
- * opts: { startTs, endTs } — segundos Unix, inclusivo.
+ * opts: { startTs, endTs, picker } — segundos Unix inclusivos; picker opcional
+ * (si viene, refresca el panel de mapeo con los remitentes del run).
  * Retorna { total, downloaded, skipped, failed, outOfRange, wordPath }.
  */
-async function runPipeline({ startTs, endTs } = {}) {
+async function runPipeline({ startTs, endTs, picker } = {}) {
   // 1. Estado de la instancia
   let inst;
   try {
@@ -101,6 +182,23 @@ async function runPipeline({ startTs, endTs } = {}) {
   M.loadNameCache();
   M.loadManualNames();
 
+  // 3b. Miembros del grupo: el phoneNumber es el puente lid→teléfono (la
+  // metadata de grupo que llenaba lidToPhone en baileys no existe acá). Un
+  // contacto que matchea por teléfono resuelve el nombre de remitentes que
+  // llegan como lid — contacts[lid] es el lookup que usa getSenderName. El
+  // puente se persiste en _lid_to_phone para que los nombres guardados bajo
+  // número (formato legacy y del panel) matcheen en corridas futuras.
+  currentMembers = [];
+  try { currentMembers = await evo.fetchGroupMembers(groupJid); }
+  catch (err) { console.log(`⚠ Sin miembros del grupo: ${err.message}`); }
+  for (const m of currentMembers) {
+    if (!m.phoneNumber) continue;
+    const name = contacts[m.phoneNumber]?.name;
+    if (name) contacts[m.id] = { name };
+  }
+  currentContacts = contacts;
+  persistLidBridge(currentMembers);
+
   // 4. Mensajes media en rango
   const msgs = await evo.findMediaMessages(groupJid, startTs, endTs);
   console.log(`📊 Comprobantes en el rango: ${msgs.length}`);
@@ -142,6 +240,12 @@ async function runPipeline({ startTs, endTs } = {}) {
   for (const m of msgs) store.set(m.key.id, m);
   M.saveCachedGroupMessages(groupJid, store);
 
+  // 6b. Refrescar el panel de mapeo: ahora el caché trae los lids de este run
+  // y los miembros el puente lid→teléfono (no-op si main no pasó picker).
+  if (picker) {
+    try { picker.setParticipants(buildParticipantEntries()); } catch { /* panel no disponible */ }
+  }
+
   // 7. Armar receipts y generar el Word
   const receipts = [];
   for (const msg of msgs) {
@@ -178,12 +282,19 @@ async function askDateRangeTerminal() {
 async function main() {
   const useWebPicker = !process.argv.includes('--terminal');
   let startDate, endDate;
+  let picker = null;
   if (useWebPicker) {
-    const activePicker = await startControlServer();
-    activePicker.attachConsole();
-    activePicker.openBrowser();
-    console.log(`📡 Panel abierto en el navegador (${activePicker.url})`);
-    ({ startDate, endDate } = await activePicker.waitForRange());
+    picker = await startControlServer();
+    picker.attachConsole();
+    picker.openBrowser();
+    // Panel de mapeo de remitentes: guarda vía saveManualName (mismo formato
+    // que saveManualNames de index.js, preservando _lid_to_phone) y entradas
+    // sembradas desde el caché local — el usuario puede mapear nombres
+    // antes de elegir el rango (runPipeline refresca con miembros al correr).
+    picker.setNameSaver(saveManualName);
+    picker.setParticipants(buildParticipantEntries());
+    console.log(`📡 Panel abierto en el navegador (${picker.url})`);
+    ({ startDate, endDate } = await picker.waitForRange());
   } else {
     ({ startDate, endDate } = await askDateRangeTerminal());
   }
@@ -194,7 +305,7 @@ async function main() {
   // viejo del día pasado NO puede confundirse con un resultado nuevo)
   try { fs.rmSync(OUTPUT_FILE, { force: true }); } catch { /* si no existe, ok */ }
 
-  await runPipeline({ startTs, endTs });
+  await runPipeline({ startTs, endTs, picker: picker || undefined });
   console.log('\nListo. Podés cerrar la ventana.');
   if (useWebPicker) process.exit(0);
 }
