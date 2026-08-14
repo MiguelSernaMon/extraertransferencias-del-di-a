@@ -28,6 +28,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
+const { config, updateConfig } = require('./config');
 const QRCode = require('qrcode');
 
 const PICKER_TIMEOUT_MS = 600_000;  // 10 min esperando el rango
@@ -81,6 +82,13 @@ const PAGE_HTML = `<!DOCTYPE html>
   .badge { display:inline-block; font-size:11px; font-weight:600; padding:3px 10px; border-radius:12px; }
   .badge.wait { background:#fef3c7; color:#8a6d1a; }
   .badge.live { background:#dcfce7; color:#166534; }
+  .badge.bad { background:#fee2e2; color:#991b1b; }
+  .connform { display:grid; grid-template-columns:1fr 1fr; gap:8px 12px; margin:10px 0; }
+  .connform label { font-size:11px; font-weight:600; color:#345; display:block; }
+  .connform input { width:100%; margin-top:3px; padding:7px 9px; font-size:13px;
+                    border:1px solid #c8d4e8; border-radius:6px; font-family:inherit; box-sizing:border-box; }
+  .connbtns { display:flex; gap:8px; flex-wrap:wrap; margin-top:4px; }
+  .connnote { font-size:11px; color:#889; margin-top:6px; min-height:14px; }
   .mapcard { margin-top:16px; border:1px solid var(--borde); border-radius:8px; padding:12px 14px; }
   .maphead { display:flex; align-items:center; justify-content:space-between; margin-bottom:2px; }
   .maphead h3 { margin:0; font-size:14px; color:var(--azul); }
@@ -160,6 +168,33 @@ const PAGE_HTML = `<!DOCTYPE html>
     <p class="mapsub">Poné el nombre de cada mensajero — se guarda al instante en nombres_mensajeros.json y se aplica a este reporte.</p>
     <div class="maplist" id="maplist"></div>
     <button class="btn mapbtn" id="mapSaveAll">💾 Guardar todos</button>
+  </div>
+
+  <!-- FASE 4: conexión WhatsApp (configurable desde acá, sin tocar config.json) -->
+  <div class="mapcard" id="conncard">
+    <div class="maphead">
+      <h3>📡 Conexión WhatsApp</h3>
+      <span class="badge wait" id="connBadge">cargando…</span>
+    </div>
+    <div class="connform">
+      <label>URL del VPS
+        <input type="text" id="cfgUrl" placeholder="https://transferencias.redpostal.co">
+      </label>
+      <label>Instancia de Evolution
+        <input type="text" id="cfgInstance" placeholder="Personal">
+      </label>
+      <label>Nombre del grupo
+        <input type="text" id="cfgGroup" placeholder="transferencias">
+      </label>
+      <label>API key
+        <input type="password" id="cfgKey" placeholder="••••••••  (dejar en blanco = mantener)">
+      </label>
+    </div>
+    <div class="connbtns">
+      <button class="btn mapbtn" id="cfgSave">💾 Guardar conexión</button>
+      <button class="btn mapbtn" id="connReconnect">📲 Reconectar WhatsApp (QR)</button>
+    </div>
+    <p class="connnote" id="connMsg"></p>
   </div>
 </div>
 </div>
@@ -344,6 +379,101 @@ const PAGE_HTML = `<!DOCTYPE html>
       if (j.ok) renderMap(j.participants);
     } catch { /* la página se actualiza sola por SSE */ }
   });
+
+  // ── Configuración de conexión (panel) ──
+  const connBadge = $('connBadge');
+  const connMsg = $('connMsg');
+  async function refreshConnState() {
+    try {
+      const r = await fetch('/api/instance');
+      const j = await r.json();
+      if (!j.ok) { connBadge.textContent = 'sin datos'; connBadge.className = 'badge bad'; return null; }
+      const s = j.status;
+      if (s === 'open') { connBadge.textContent = 'conectada ✓'; connBadge.className = 'badge live'; connMsg.textContent = ''; }
+      else if (s === 'connecting') { connBadge.textContent = 'conectando…'; connBadge.className = 'badge wait'; }
+      else if (s === 'close') { connBadge.textContent = 'desconectada'; connBadge.className = 'badge bad'; }
+      else { connBadge.textContent = 'desconocido'; connBadge.className = 'badge wait'; }
+      return j;
+    } catch {
+      connBadge.textContent = 'sin conexión con la app'; connBadge.className = 'badge bad';
+      return null;
+    }
+  }
+  (async function loadCfg() {
+    try {
+      const r = await fetch('/api/config');
+      const j = await r.json();
+      if (j.ok) {
+        $('cfgUrl').value = j.evolutionUrl || '';
+        $('cfgInstance').value = j.instance || '';
+        $('cfgGroup').value = j.groupName || '';
+        $('cfgKey').placeholder = j.hasApiKey ? '••••••••  (dejar en blanco = mantener)' : 'API key (obligatoria)';
+      }
+    } catch { /* la app puede no estar lista aún */ }
+  })();
+  refreshConnState();
+
+  $('cfgSave').addEventListener('click', async () => {
+    const body = {};
+    const url = $('cfgUrl').value.trim(); if (url) body.evolutionUrl = url;
+    const inst = $('cfgInstance').value.trim(); if (inst) body.instance = inst;
+    const grp = $('cfgGroup').value.trim(); if (grp) body.groupName = grp;
+    const key = $('cfgKey').value.trim(); if (key) body.apiKey = key;
+    if (!Object.keys(body).length) { connMsg.textContent = 'Sin cambios para guardar'; return; }
+    const btn = $('cfgSave');
+    btn.disabled = true; btn.textContent = '…';
+    try {
+      const r = await fetch('/api/config', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const j = await r.json();
+      if (j.ok) {
+        connMsg.textContent = '✓ Conexión guardada — aplica al próximo run';
+        $('cfgKey').value = '';
+        $('cfgKey').placeholder = '••••••••  (dejar en blanco = mantener)';
+        refreshConnState();
+      } else { connMsg.textContent = '❌ ' + (j.error || 'error'); }
+    } catch { connMsg.textContent = '❌ No se pudo contactar la aplicación'; }
+    btn.disabled = false; btn.textContent = '💾 Guardar conexión';
+  });
+
+  let qrPoll = null;
+  $('connReconnect').addEventListener('click', async () => {
+    const btn = $('connReconnect');
+    btn.disabled = true; btn.textContent = '…';
+    connMsg.textContent = 'Solicitando QR a Evolution…';
+    try {
+      const r = await fetch('/api/connect', { method: 'POST' });
+      const j = await r.json();
+      if (!j.ok || !j.qrcode) { connMsg.textContent = '❌ ' + (j.error || 'Evolution no devolvió QR'); return; }
+      // El QR vive en el recuadro de la fase de extracción → mostrarla
+      const origTitle = $('subtitle').textContent;
+      $('subtitle').textContent = 'Escaneá el QR con WhatsApp en el teléfono de la SIM';
+      $('rangePhase').classList.add('hidden');
+      $('statusPhase').classList.remove('hidden');
+      $('qrImg').src = j.qrcode;
+      $('qrbox').classList.remove('hidden');
+      setBadge('esperando escaneo del QR', 'wait');
+      appendLog('🔳 QR de reconexión — escanealo con WhatsApp');
+      // Pollear hasta que la instancia quede open (o el usuario cierre la pestaña)
+      qrPoll = setInterval(async () => {
+        const st = await refreshConnState();
+        if (st && st.ok && st.status === 'open') {
+          clearInterval(qrPoll); qrPoll = null;
+          $('statusPhase').classList.add('hidden');
+          $('rangePhase').classList.remove('hidden');
+          $('subtitle').textContent = origTitle;
+          connMsg.textContent = '✓ WhatsApp reconectado';
+          appendLog('✅ WhatsApp reconectado');
+        }
+      }, 3000);
+    } catch {
+      connMsg.textContent = '❌ No se pudo contactar la aplicación';
+    } finally {
+      btn.disabled = false; btn.textContent = '📲 Reconectar WhatsApp (QR)';
+    }
+  });
 </script>
 </body>
 </html>
@@ -389,6 +519,9 @@ function startControlServer() {
       _downloads: 0,           // veces que se descargó el archivo
       _participants: [],       // lista para mapear nombres { lid, phone, name }
       _nameSaver: null,        // callback (key, name) → persiste en index.js
+      _instanceChecker: null,  // () → {found, status} estado de la instancia
+      _connector: null,        // () → data de /instance/connect (QR) o {error}
+      _configApplied: null,    // ({instance, changed}) → se llama tras guardar config
     };
 
     function emit(event, data) {
@@ -439,6 +572,11 @@ function startControlServer() {
     };
     // Callback para persistir un nombre asignado (lo implementa index.js)
     handle.setNameSaver = (cb) => { handle._nameSaver = cb; };
+
+    // Conexión: proveedor de estado / conector QR / callback post-config
+    handle.setInstanceChecker = (fn) => { handle._instanceChecker = fn; };
+    handle.setConnector = (fn) => { handle._connector = fn; };
+    handle.setConfigApplied = (fn) => { handle._configApplied = fn; };
 
     handle.waitForRange = (timeoutMs = PICKER_TIMEOUT_MS) => new Promise((resolveRange, rejectRange) => {
       if (handle._range) { resolveRange(handle._range); return; }
@@ -528,6 +666,61 @@ function startControlServer() {
       // Lista de participantes (para mapear IDs → nombres)
       if (req.method === 'GET' && req.url === '/api/participants') {
         sendJson(res, 200, { ok: true, participants: handle._participants || [] });
+        return;
+      }
+
+      // Configuración de conexión (GET: apiKey enmascarada; POST: guardar en vivo)
+      if (req.method === 'GET' && req.url === '/api/config') {
+        sendJson(res, 200, {
+          ok: true,
+          evolutionUrl: config.evolutionUrl,
+          instance: config.instance,
+          groupName: config.groupName,
+          hasApiKey: !!config.apiKey,
+        });
+        return;
+      }
+      if (req.method === 'POST' && req.url === '/api/config') {
+        let body = '';
+        req.on('data', c => { body += c; });
+        req.on('end', () => {
+          let data;
+          try { data = JSON.parse(body); } catch { sendJson(res, 400, { ok: false, error: 'JSON inválido.' }); return; }
+          const prevInstance = config.instance;
+          let next;
+          try { next = updateConfig(data); }
+          catch (err) { sendJson(res, 500, { ok: false, error: err.message }); return; }
+          try { if (handle._configApplied) handle._configApplied({ instance: next.instance, changed: prevInstance !== next.instance }); } catch { /* el host decide */ }
+          handle.pushLog(`⚙ Conexión guardada (instancia: ${next.instance})`);
+          sendJson(res, 200, { ok: true, instance: next.instance });
+        });
+        return;
+      }
+
+      // Estado de la instancia (proveedor = index-evolution.js)
+      if (req.method === 'GET' && req.url === '/api/instance') {
+        if (!handle._instanceChecker) { sendJson(res, 200, { ok: false, error: 'sin proveedor de estado' }); return; }
+        Promise.resolve(handle._instanceChecker())
+          .then(s => sendJson(res, 200, { ok: true, ...s, instance: config.instance }))
+          .catch(e => sendJson(res, 200, { ok: false, error: e.message }));
+        return;
+      }
+
+      // Reconectar WhatsApp (QR) — proveedor = evolution-client.connectInstance
+      if (req.method === 'POST' && req.url === '/api/connect') {
+        if (!handle._connector) { sendJson(res, 500, { ok: false, error: 'La aplicación aún no conectó proveedor.' }); return; }
+        Promise.resolve(handle._connector())
+          .then(d => {
+            if (d && d.error) { sendJson(res, 500, { ok: false, error: d.error }); return; }
+            const q = d?.qrcode;
+            const b64 = typeof q === 'string' ? q : q?.base64;
+            if (!b64) { sendJson(res, 500, { ok: false, error: 'Evolution no devolvió QR' }); return; }
+            const imgUrl = b64.startsWith('data:') ? b64 : `data:image/png;base64,${b64}`;
+            try { handle.sendQR(imgUrl); } catch { /* la página puede no estar abierta */ }
+            handle.pushLog('📲 QR de reconexión enviado al panel — escanealo con WhatsApp');
+            sendJson(res, 200, { ok: true, qrcode: imgUrl });
+          })
+          .catch(e => sendJson(res, 500, { ok: false, error: e.message }));
         return;
       }
 

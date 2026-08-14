@@ -163,6 +163,17 @@ async function checkInstance() {
   return { found: true, status: inst.connectionStatus || inst.status || 'unknown' };
 }
 
+/** Inicia sesión/QR de la instancia (desde el panel). Devuelve la data cruda
+ *  ({qrcode: {code, base64}, pairingCode, ...}) o { error } si falla. El panel
+ *  muestra el QR y la terminal/panel reflejan el estado al conectar. */
+async function connectInstance() {
+  try {
+    return await apiRequest('POST', `/instance/connect/${config.instance}`);
+  } catch (err) {
+    return { error: err.message };
+  }
+}
+
 const isMedia = (msg) => !!msg.message?.imageMessage || !!msg.message?.documentMessage;
 
 /** Mensajes media del grupo en [startTs, endTs], filtrados client-side.
@@ -214,6 +225,7 @@ module.exports = {
   findMediaMessages,
   downloadMedia,
   checkInstance,
+  connectInstance,
   normalizeRecord,
   toSeconds,
   apiRequest,

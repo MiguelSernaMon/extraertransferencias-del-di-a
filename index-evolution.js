@@ -324,6 +324,20 @@ async function main() {
     // antes de elegir el rango (runPipeline refresca con miembros al correr).
     picker.setNameSaver(saveManualName);
     picker.setParticipants(buildParticipantEntries());
+    // Conexión configurable desde el panel: estado de la instancia, reconexión
+    // con QR y guardado en vivo (updateConfig en config.js). Si cambia la
+    // instancia, el groupJid cacheado no sirve → se limpia el caché.
+    picker.setInstanceChecker(async () => {
+      try { return await evo.checkInstance(); }
+      catch (err) { return { found: false, status: 'unknown', error: err.message }; }
+    });
+    picker.setConnector(() => evo.connectInstance());
+    picker.setConfigApplied(({ changed }) => {
+      if (changed) {
+        try { fs.rmSync(CACHE_FILE, { force: true }); } catch { /* no existe */ }
+        console.log('🔄 Instancia cambiada: caché de grupo limpiado');
+      }
+    });
     console.log(`📡 Panel abierto en el navegador (${picker.url})`);
     ({ startDate, endDate } = await picker.waitForRange());
   } else {
