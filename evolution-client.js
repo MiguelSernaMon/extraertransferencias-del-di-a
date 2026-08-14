@@ -33,15 +33,22 @@ function toSeconds(ts) {
 /** Normaliza un record de Evolution a la forma que usa el pipeline (como baileys).
  *  Contrato real: messageTimestamp viene DIRECTO en el record (segundos) — el
  *  campo `timestamp` no existe en producción. Se conserva el fallback legacy
- *  por compatibilidad con fixtures viejas. pushName se preserva: getSenderName
- *  lo usa para resolver remitentes sin participant (puede ser un LID numérico,
- *  aún así se preserva). */
+ *  por compatibilidad con fixtures viejas.
+ *  pushName: se preserva EXCEPTO cuando es el ECO del lid — Evolution manda
+ *  pushName = "77150682091545" para participant "77150682091545@lid" cuando no
+ *  conoce el nombre. Ese eco no es un nombre: si pasa, getSenderName lo devuelve
+ *  como tal y el Word muestra el lid aunque exista el puente lid→teléfono. Se
+ *  descarta y el fallback de getSenderName usa el teléfono real del puente. */
 function normalizeRecord(record) {
+  const participant = record.key?.participant;
+  const pushName = record.pushName && participant?.endsWith('@lid') && record.pushName === participant.split('@')[0]
+    ? null
+    : record.pushName;
   return {
     key: record.key,
     message: record.message,
     messageTimestamp: toSeconds(record.messageTimestamp ?? record.timestamp),
-    pushName: record.pushName,
+    pushName,
   };
 }
 

@@ -23,6 +23,33 @@ const OUTPUT_FILE = 'Comprobantes_Descargados.docx';
 const MEDIA_CACHE_DIR = './media_cache';
 const CACHE_FILE = './group_cache.json';
 const NOMBRES_FILE = './nombres_mensajeros.json';
+const MSG_CACHE_FILE = './group_messages_cache.json';
+
+/** Runs anteriores guardaron pushName = ECO del lid (ej. "77150682091545" para
+ *  participant "77150682091545@lid") ANTES del fix en normalizeRecord.
+ *  loadCachedGroupMessages vuelca esos ecos al nameCache interno de index.js y
+ *  getSenderName los devuelve como "nombre" → el Word muestra el lid aunque el
+ *  puente lid→teléfono tenga el número. Se limpian una vez al arrancar
+ *  (eco → null / borrado); nameCache se reconstruye limpio. */
+function sanitizeLidEchoes() {
+  for (const file of [MSG_CACHE_FILE, 'name_cache.json']) {
+    let data = null;
+    try { data = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { continue; }
+    if (!data) continue;
+    let changed = false;
+    if (Array.isArray(data)) { // caché de mensajes: [{key, pushName, ...}]
+      for (const m of data) {
+        const p = m.key?.participant;
+        if (p?.endsWith('@lid') && m.pushName === p.split('@')[0]) { m.pushName = null; changed = true; }
+      }
+    } else { // name_cache: { jid: nombre }
+      for (const [jid, name] of Object.entries(data)) {
+        if (jid.endsWith('@lid') && name === jid.split('@')[0]) { delete data[jid]; changed = true; }
+      }
+    }
+    if (changed) { atomicWriteFileSync(file, JSON.stringify(data)); console.log(`🧹 Caché ${file}: ecos de lid limpiados`); }
+  }
+}
 
 const CONCURRENCY = 2;
 const RETRIES = 3;
@@ -130,6 +157,10 @@ async function downloadQueue(items, worker, concurrency) {
  * Retorna { total, downloaded, skipped, failed, outOfRange, wordPath }.
  */
 async function runPipeline({ startTs, endTs, picker } = {}) {
+  // 0. Limpiar ecos de lid en cachés (ver sanitizeLidEchoes) ANTES de que
+  // loadNameCache/loadCachedGroupMessages poblen el nameCache del módulo.
+  sanitizeLidEchoes();
+
   // 1. Estado de la instancia
   let inst;
   try {
