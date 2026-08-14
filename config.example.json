@@ -1,7 +1,7 @@
 {
   "evolutionUrl": "https://transferencias.redpostal.co",
   "apiKey": "PONER_API_KEY_DEL_VPS",
-  "instance": "comprobantes",
+  "instance": "Personal",
   "groupName": "transferencias",
   "caFile": ""
 }

@@ -4,7 +4,8 @@
   "description": "Descarga imágenes de un grupo de WhatsApp y las exporta a Word",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index-evolution.js",
+    "start:terminal": "node index-evolution.js --terminal"
   },
   "dependencies": {
     "@whiskeysockets/baileys": "^6.7.21",

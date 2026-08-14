@@ -17,3 +17,5 @@ temp_index_copy.txt
 
 config.json
 .env
+*.docx.bak
+*.bak-e2e*
