@@ -174,6 +174,21 @@ async function connectInstance() {
   }
 }
 
+/** Crea la instancia en Evolution y devuelve su QR — enlaza el número nuevo
+ *  desde el panel cuando la instancia no existe (ej. tras borrar el número
+ *  viejo del VPS). Contrato v2: POST /instance/create/{instance} con body
+ *  {createWithQr: true}; devuelve {instance, qrcode: {code, base64}, ...}.
+ *  Si el server ignora el body y no trae qrcode, se cierra con connect. */
+async function createInstance() {
+  try {
+    const data = await apiRequest('POST', `/instance/create/${config.instance}`, { createWithQr: true });
+    if (data?.qrcode) return data;
+    return await connectInstance();
+  } catch (err) {
+    return { error: err.message };
+  }
+}
+
 const isMedia = (msg) => !!msg.message?.imageMessage || !!msg.message?.documentMessage;
 
 /** Mensajes media del grupo en [startTs, endTs], filtrados client-side.
@@ -226,6 +241,7 @@ module.exports = {
   downloadMedia,
   checkInstance,
   connectInstance,
+  createInstance,
   normalizeRecord,
   toSeconds,
   apiRequest,

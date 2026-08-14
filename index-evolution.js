@@ -331,7 +331,16 @@ async function main() {
       try { return await evo.checkInstance(); }
       catch (err) { return { found: false, status: 'unknown', error: err.message }; }
     });
-    picker.setConnector(() => evo.connectInstance());
+    picker.setConnector(async () => {
+      // Si la instancia no existe (ej. número borrado del VPS), crearla sola
+      // con QR — el panel enlaza el número nuevo sin tocar la UI de Evolution.
+      const r = await evo.connectInstance();
+      if (r.error && /(not.?found|404|no existe|doesn.t? exist)/i.test(r.error)) {
+        console.log(`🆕 Instancia "${config.instance}" no existe — creándola en Evolution…`);
+        return evo.createInstance();
+      }
+      return r;
+    });
     picker.setConfigApplied(({ changed }) => {
       if (changed) {
         try { fs.rmSync(CACHE_FILE, { force: true }); } catch { /* no existe */ }

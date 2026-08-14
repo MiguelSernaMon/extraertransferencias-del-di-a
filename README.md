@@ -53,8 +53,10 @@ quedan guardados en `nombres_mensajeros.json` para las próximas corridas.
 ### Operación
 
 - El teléfono de la SIM debe estar enchufado y conectado a WhatsApp.
-- Si la instancia se desconecta, escanear el QR una sola vez en la UI de
-  Evolution del VPS (la sesión queda persistida en el VPS).
+- Si la instancia se desconecta (o hay que enlazar otro número), usar el
+  botón **📲 Reconectar WhatsApp (QR)** del panel: si la instancia no existe
+  se crea sola en Evolution y el QR se escanea con el teléfono (la sesión
+  queda persistida en el VPS).
 - Salida: `Comprobantes_Descargados.docx` (en esta carpeta).
 
 ### Windows
