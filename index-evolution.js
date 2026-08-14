@@ -94,6 +94,13 @@ async function runPipeline({ startTs, endTs } = {}) {
   try { contacts = await evo.findContactsMap(); }
   catch (err) { console.log(`⚠ Sin contactos de Evolution: ${err.message}`); }
 
+  // Nombres persistidos del usuario: caché de nombres + nombres_mensajeros.json.
+  // Sin esto el modo Evolution ignora el mapeo del usuario y los remitentes
+  // no-contactos salen como número crudo (reviewer §3.4 paso 4). Las dos
+  // funciones son idempotentes (solo cargan mapas que usa getSenderName).
+  M.loadNameCache();
+  M.loadManualNames();
+
   // 4. Mensajes media en rango
   const msgs = await evo.findMediaMessages(groupJid, startTs, endTs);
   console.log(`📊 Comprobantes en el rango: ${msgs.length}`);

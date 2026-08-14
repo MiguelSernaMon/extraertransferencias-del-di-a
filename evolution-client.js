@@ -10,8 +10,12 @@ const { URL } = require('url');
 const { config, getAgent } = require('./config');
 const { toUnix, isMsgInRange } = require('./index.js');
 
-const TAKE = 500;
-const MAX_PAGES = 40;
+// Contrato real v2.3.7 (verificado contra el VPS): `take` es IGNORADO por el
+// server (página fija de 50) y `orderBy` también (siempre desc). Se manda
+// take: 50 igual (inofensivo) + page explícito. MAX_PAGES cubre ~20 días a
+// ~750 msgs/día (300 × 50 = 15000 records).
+const TAKE = 50;
+const MAX_PAGES = 300;
 
 /** Convierte el timestamp de un record (number | string | Long | ISO) a segundos Unix. */
 function toSeconds(ts) {
@@ -26,12 +30,18 @@ function toSeconds(ts) {
   return 0;
 }
 
-/** Normaliza un record de Evolution a la forma que usa el pipeline (como baileys). */
+/** Normaliza un record de Evolution a la forma que usa el pipeline (como baileys).
+ *  Contrato real: messageTimestamp viene DIRECTO en el record (segundos) — el
+ *  campo `timestamp` no existe en producción. Se conserva el fallback legacy
+ *  por compatibilidad con fixtures viejas. pushName se preserva: getSenderName
+ *  lo usa para resolver remitentes sin participant (puede ser un LID numérico,
+ *  aún así se preserva). */
 function normalizeRecord(record) {
   return {
     key: record.key,
     message: record.message,
-    messageTimestamp: toSeconds(record.timestamp ?? record.messageTimestamp),
+    messageTimestamp: toSeconds(record.messageTimestamp ?? record.timestamp),
+    pushName: record.pushName,
   };
 }
 
@@ -89,12 +99,13 @@ async function apiRequest(method, path, body) {
   }
 }
 
-/** Grupos disponibles: [{id, subject}]. fetchAllGroups; fallback findChats
- *  filtrando @g.us (endpoint a confirmar contra la instalación real). */
+/** Grupos disponibles: [{id, subject}]. fetchAllGroups (requiere
+ *  ?getParticipants=true — sin el param el server devuelve 400); fallback
+ *  findChats filtrando @g.us. */
 async function listGroups() {
   let data = null;
   try {
-    data = await apiRequest('GET', `/group/fetchAllGroups/${config.instance}`);
+    data = await apiRequest('GET', `/group/fetchAllGroups/${config.instance}?getParticipants=true`);
   } catch {
     data = await apiRequest('GET', `/chat/findChats/${config.instance}`);
   }
@@ -104,13 +115,18 @@ async function listGroups() {
     .map(g => ({ id: g.id || g.jid, subject: g.subject || g.name || '' }));
 }
 
-/** Contactos: { '<jid>': { name } } — jid completo como lo devuelve Evolution. */
+/** Contactos: { '<jid>': { name } } — jid completo como lo devuelve Evolution.
+ *  Contrato real: es POST /chat/findContacts/{instance} (GET → 404) y el body
+ *  SIEMPRE lleva {take: 500} — body vacío crashea el contenedor (connection
+ *  reset instantáneo + API caída ~2 min). Respuesta: array directo de
+ *  contacts [{remoteJid, pushName, ...}]. */
 async function findContactsMap() {
-  const data = await apiRequest('GET', `/chat/findContacts/${config.instance}`);
+  const data = await apiRequest('POST', `/chat/findContacts/${config.instance}`, { take: 500 });
   const map = {};
   if (Array.isArray(data)) {
     for (const c of data) {
-      if (c?.id) map[c.id] = { name: c.name || c.pushName || c.notify || '' };
+      const jid = c?.remoteJid || c?.id;
+      if (jid) map[jid] = { name: c.pushName || c.name || c.notify || '' };
     }
   }
   return map;
@@ -127,20 +143,25 @@ async function checkInstance() {
 
 const isMedia = (msg) => !!msg.message?.imageMessage || !!msg.message?.documentMessage;
 
-/** Mensajes media del grupo en [startTs, endTs], paginados, filtrados client-side.
- *  Escaneo completo hasta MAX_PAGES (el server puede no respetar el orden pedido). */
+/** Mensajes media del grupo en [startTs, endTs], filtrados client-side.
+ *  Contrato real: página fija de 50 records, paginación por `page` (1-based),
+ *  respuesta {messages:{total, pages, currentPage, records}}, SIEMPRE desc
+ *  (nuevo primero) — orderBy se ignora. `where` solo {key:{remoteJid}}.
+ *  Dedupe por key.id obligatorio (el server devuelve records duplicados).
+ *  Early-exit: si TODA la página es más vieja que startTs, las siguientes son
+ *  aún más viejas (orden desc) → cortar sin escanear el resto del grupo. */
 async function findMediaMessages(jid, startTs, endTs) {
   const out = new Map();
-  for (let page = 0; page < MAX_PAGES; page++) {
+  for (let page = 1; page <= MAX_PAGES; page++) {
     const body = {
       where: { key: { remoteJid: jid } },
-      take: TAKE,
-      skip: page * TAKE,
-      orderBy: { timestamp: 'asc' },
+      take: TAKE, // el server lo ignora (página fija de 50) — se manda igual
+      page,
     };
     const data = await apiRequest('POST', `/chat/findMessages/${config.instance}`, body);
     const records = data?.messages?.records || [];
     if (records.length === 0) break;
+    if (records.every(r => toSeconds(r.messageTimestamp ?? r.timestamp) < startTs)) break;
     for (const r of records) {
       const msg = normalizeRecord(r);
       if (msg.key?.remoteJid !== jid) continue;      // filtro server puede no aplicar (#1632)
@@ -152,10 +173,13 @@ async function findMediaMessages(jid, startTs, endTs) {
   return [...out.values()].sort((a, b) => a.messageTimestamp - b.messageTimestamp);
 }
 
-/** Descarga el media de un mensaje. Envía el mensaje COMPLETO (el server
- *  consulta la DB por el objeto; solo el id falla en media viejo). */
+/** Descarga el media de un mensaje. Contrato real: el body DEBE ser
+ *  {message: <record completo normalizado>} — el server consulta
+ *  msg.message.ephemeralMessage y sin wrapper devuelve 400. Respuesta 201:
+ *  {mediaType, fileName, caption, size, mimetype, base64, buffer}; se lee
+ *  base64 (+ mimetype) y se guarda como media_cache/<key.id>.jpg. */
 async function downloadMedia(msg) {
-  const body = { key: msg.key, message: msg.message };
+  const body = { message: msg };
   const data = await apiRequest('POST', `/chat/getBase64FromMediaMessage/${config.instance}`, body);
   if (!data?.base64) throw new Error('Evolution no devolvió media para el mensaje');
   return { buffer: Buffer.from(data.base64, 'base64'), mimeType: data.mimetype || 'image/jpeg' };
