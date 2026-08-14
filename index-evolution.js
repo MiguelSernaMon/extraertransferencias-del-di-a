@@ -350,8 +350,15 @@ async function main() {
   } else {
     ({ startDate, endDate } = await askDateRangeTerminal());
   }
-  const startTs = Math.floor(startDate.getTime() / 1000);
-  const endTs = Math.floor(endDate.getTime() / 1000);
+  // Los días se interpretan como días LOCALES (Bogotá) y el día fin es
+  // INCLUSIVO: "13 a 14" toma el 13 completo + el 14 completo. new Date('YYYY-MM-DD')
+  // cae en medianoche UTC → se re-parsea la fecha ISO como medianoche local.
+  const dayStartLocal = (d) => {
+    const [y, m, dd] = d.toISOString().slice(0, 10).split('-').map(Number);
+    return Math.floor(new Date(y, m - 1, dd).getTime() / 1000);
+  };
+  const startTs = dayStartLocal(startDate);
+  const endTs = dayStartLocal(endDate) + 86399; // fin del día local (inclusivo)
 
   // Borrar el Word de corridas anteriores (mismo patrón que index.js: el archivo
   // viejo del día pasado NO puede confundirse con un resultado nuevo)
