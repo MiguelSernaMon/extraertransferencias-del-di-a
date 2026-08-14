@@ -408,27 +408,31 @@ const PAGE_HTML = `<!DOCTYPE html>
         $('cfgUrl').value = j.evolutionUrl || '';
         $('cfgGroup').value = j.groupName || '';
         $('cfgKey').placeholder = j.hasApiKey ? '••••••••  (dejar en blanco = mantener)' : 'API key (obligatoria)';
-        // Selector: instancias existentes en Evolution + la configurada
+        // Selector: SOLO instancias reales de Evolution. Si la instancia
+        // configurada ya no existe (ej. "Personal" borrada del VPS), no se
+        // ofrece como opción — queda preseleccionada la primera real.
         try {
           const ri = await fetch('/api/instances');
           const ji = await ri.json();
-          const opts = ji.instances || [];
+          const opts = (ji.instances || []).filter(i => i.name);
           instSel.innerHTML = '';
-          if (j.instance) {
-            const cur = document.createElement('option');
-            cur.value = j.instance; cur.textContent = j.instance + ' (configurada)';
-            instSel.appendChild(cur);
+          const realNames = new Set(opts.map(i => i.name));
+          let options = opts;
+          if (j.instance && !realNames.has(j.instance)) {
+            // config apunta a una instancia inexistente → no se muestra;
+            // el select preselecciona la primera instancia real.
+            options = opts.length ? opts : [];
           }
-          for (const i of opts) {
-            if (i.name && i.name !== j.instance) {
-              const o = document.createElement('option');
-              o.value = i.name; o.textContent = i.name + (i.status === 'open' ? ' ✓' : (i.number ? ' — ' + i.number : ''));
-              instSel.appendChild(o);
-            }
+          for (const i of options) {
+            const o = document.createElement('option');
+            o.value = i.name;
+            o.textContent = i.name + (i.status === 'open' ? ' ✓' : (i.number ? ' — ' + i.number : ''));
+            if (i.name === j.instance) o.selected = true;
+            instSel.appendChild(o);
           }
-          if (opts.length === 0 && !j.instance) {
+          if (options.length === 0) {
             const e = document.createElement('option');
-            e.value = ''; e.textContent = '(sin instancias — creala en Evolution)';
+            e.value = ''; e.textContent = '(sin instancias en Evolution — creala en la UI del VPS)';
             instSel.appendChild(e);
           }
         } catch {
@@ -487,6 +491,8 @@ const PAGE_HTML = `<!DOCTYPE html>
       setBadge('esperando escaneo del QR', 'wait');
       appendLog('🔳 QR de reconexión — escanealo con WhatsApp');
       // Pollear hasta que la instancia quede open (o el usuario cierre la pestaña)
+      const qrShownAt = Date.now();
+      let hintShown = false;
       qrPoll = setInterval(async () => {
         const st = await refreshConnState();
         if (st && st.ok && st.status === 'open') {
@@ -496,6 +502,11 @@ const PAGE_HTML = `<!DOCTYPE html>
           $('subtitle').textContent = origTitle;
           connMsg.textContent = '✓ WhatsApp reconectado';
           appendLog('✅ WhatsApp reconectado');
+        } else if (!hintShown && Date.now() - qrShownAt > 90000) {
+          // 90s sin completar: el QR no se escaneó o el número fue rechazado
+          hintShown = true;
+          connMsg.textContent = '¿Escaneaste el QR? Si ya lo escaneaste y sigue en "conectando", WhatsApp rechazó el número (401) — revisá que no esté activo en otro teléfono y probá Reconectar de nuevo.';
+          appendLog('⚠ El QR no completó en 90s — revisá que el número no esté en uso en otro dispositivo');
         }
       }, 3000);
     } catch {
