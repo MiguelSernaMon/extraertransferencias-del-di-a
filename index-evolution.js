@@ -364,7 +364,14 @@ async function main() {
   // viejo del día pasado NO puede confundirse con un resultado nuevo)
   try { fs.rmSync(OUTPUT_FILE, { force: true }); } catch { /* si no existe, ok */ }
 
-  await runPipeline({ startTs, endTs, picker: picker || undefined });
+  const result = await runPipeline({ startTs, endTs, picker: picker || undefined });
+  if (useWebPicker && picker && result.wordPath) {
+    // Mostrar el link de descarga en el panel y mantener el servidor vivo
+    // hasta que descargue (o 5 min). Sin esto el proceso moría apenas
+    // terminaba y el navegador nunca podía bajar el Word.
+    try { picker.notifyFile(result.wordPath); } catch { /* panel cerrado */ }
+    try { await picker.waitForDownloadOrTimeout(300_000); } catch { /* igual seguimos */ }
+  }
   console.log('\nListo. Podés cerrar la ventana.');
   if (useWebPicker) process.exit(0);
 }
