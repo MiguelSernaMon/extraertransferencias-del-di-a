@@ -3,6 +3,10 @@
 // Consulta mensajes/contactos/grupos y descarga media. Filtrado client-side
 // SIEMPRE: el filtro remoteJid del server puede no aplicarse (issue #1632).
 
+const http = require('http');
+const https = require('https');
+const { URL } = require('url');
+
 const { config, getAgent } = require('./config');
 const { toUnix, isMsgInRange } = require('./index.js');
 
@@ -31,26 +35,48 @@ function normalizeRecord(record) {
   };
 }
 
-/** fetch con apikey + agent (CA custom) + timeout. Lanza Error con detalle del server. */
+/** Lee el body completo de una respuesta HTTP y lo parsea como JSON.
+ *  Rechaza si el body no es JSON (el caller lo ignora) o si se corta la lectura. */
+function readJson(res) {
+  return new Promise((resolve, reject) => {
+    let raw = '';
+    res.setEncoding('utf8');
+    res.on('data', c => { raw += c; });
+    res.on('end', () => {
+      try { resolve(JSON.parse(raw)); } catch (e) { reject(e); }
+    });
+    res.on('aborted', () => reject(new Error('respuesta abortada por el server')));
+    res.on('error', reject);
+  });
+}
+
+/** Request HTTP con apikey + agent (CA custom) + timeout. Lanza Error con detalle del server.
+ *  Usa http/https.request (NO fetch): undici ignora la opción `agent` de RequestInit,
+ *  por lo que el pinning CA del plan (https.Agent({ ca })) solo funciona con el
+ *  transporte nativo. Mismo contrato de retorno: JSON parseado. */
 async function apiRequest(method, path, body) {
-  const url = `${config.evolutionUrl}${path}`;
+  const url = new URL(`${config.evolutionUrl}${path}`);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 30_000);
   try {
-    const res = await fetch(url, {
-      method,
-      headers: {
-        'Content-Type': 'application/json',
-        apikey: config.apiKey,
-      },
-      body: body === undefined ? undefined : JSON.stringify(body),
-      signal: controller.signal,
-      agent: getAgent(),
+    const res = await new Promise((resolve, reject) => {
+      const mod = url.protocol === 'https:' ? https : http;
+      const req = mod.request(url, {
+        method,
+        headers: {
+          'Content-Type': 'application/json',
+          apikey: config.apiKey,
+        },
+        agent: getAgent(),
+        signal: controller.signal,
+      }, resolve);
+      req.on('error', reject);
+      if (body === undefined) req.end(); else req.end(JSON.stringify(body));
     });
     let data = null;
-    try { data = await res.json(); } catch { /* body no JSON */ }
-    if (!res.ok) {
-      const msg = data?.error?.message || `HTTP ${res.status}`;
+    try { data = await readJson(res); } catch { /* body no JSON */ }
+    if (!(res.statusCode >= 200 && res.statusCode < 300)) {
+      const msg = data?.error?.message || `HTTP ${res.statusCode}`;
       throw new Error(`Evolution ${path}: ${msg}`);
     }
     return data;
