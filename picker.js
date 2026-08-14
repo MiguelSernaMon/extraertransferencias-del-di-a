@@ -806,12 +806,22 @@ function startControlServer() {
             'Content-Disposition': `attachment; filename="${handle.fileInfo.name}"`,
             'Content-Length': buf.length,
           });
-          res.end(buf);
           handle._downloads += 1;
-          // Despertar a quienes esperan la descarga
-          const waiters = handle._dlWaiters;
-          handle._dlWaiters = [];
-          waiters.forEach(w => w('downloaded'));
+          // Despertar a main recién cuando la respuesta se FLUYÓ completa
+          // ('finish') o la conexión se cerró ('close'). Notificar en res.end()
+          // hacía que process.exit(0) matara el proceso con el archivo a
+          // mitad de envío (16 MB truncados) → descarga rota + "servidor caído".
+          let notified = false;
+          const fire = () => {
+            if (notified) return;
+            notified = true;
+            const waiters = handle._dlWaiters;
+            handle._dlWaiters = [];
+            waiters.forEach(w => w('downloaded'));
+          };
+          res.on('finish', fire);
+          res.on('close', fire);
+          res.end(buf);
         });
         return;
       }

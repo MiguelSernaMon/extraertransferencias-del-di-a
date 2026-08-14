@@ -370,7 +370,14 @@ async function main() {
     // hasta que descargue (o 5 min). Sin esto el proceso moría apenas
     // terminaba y el navegador nunca podía bajar el Word.
     try { picker.notifyFile(result.wordPath); } catch { /* panel cerrado */ }
-    try { await picker.waitForDownloadOrTimeout(300_000); } catch { /* igual seguimos */ }
+    const dl = await picker.waitForDownloadOrTimeout(300_000).catch(() => 'timeout');
+    if (dl === 'downloaded') {
+      // Descarga terminada: cerrar SSE + servidor y darle a TCP un momento
+      // para vaciar el socket antes de salir (sin esto process.exit cortaba
+      // el archivo a mitad de envío).
+      try { await picker.close(); } catch { /* ya cerrado */ }
+      await new Promise(r => setTimeout(r, 750));
+    }
   }
   console.log('\nListo. Podés cerrar la ventana.');
   if (useWebPicker) process.exit(0);
