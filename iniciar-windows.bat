@@ -30,7 +30,7 @@ IF NOT EXIST "node_modules\" (
 :: Ejecutar el script principal
 echo [INFO] Iniciando el sistema...
 echo.
-call node index.js
+call node index-evolution.js
 
 echo.
 echo ================================================================
