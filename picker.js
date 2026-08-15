@@ -729,7 +729,10 @@ function startControlServer() {
           const waiters = handle._waiters;
           handle._waiters = [];
           waiters.forEach(w => w(handle._range));
-          handle.pushLog(`📅 Rango recibido: ${startDate.toLocaleString('es-CO')} → ${endDate.toLocaleString('es-CO')}`);
+          // Log en HORA COLOMBIANA explícita: formatear los Date de ancla (UTC
+          // medianoche) en la TZ de la máquina confundía (13/8 7:00pm en vez
+          // del rango real con horas).
+          handle.pushLog(`📅 Rango recibido: ${sd} ${st} → ${ed} ${et} (hora Colombia)`);
         });
         return;
       }
