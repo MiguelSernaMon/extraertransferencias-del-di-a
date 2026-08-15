@@ -287,7 +287,7 @@ async function runPipeline({ startTs, endTs, picker } = {}) {
     receipts.push({
       imageBuffer: fs.readFileSync(mediaPath),
       senderName: M.getSenderName(msg, contacts),
-      date: new Date(msg.messageTimestamp * 1000).toLocaleString('es-CO'),
+      date: new Date(msg.messageTimestamp * 1000).toLocaleString('es-CO', { timeZone: 'America/Bogota' }),
     });
   }
   if (receipts.length === 0) {
@@ -312,7 +312,7 @@ async function askDateRangeTerminal() {
 
 async function main() {
   const useWebPicker = !process.argv.includes('--terminal');
-  let startDate, endDate;
+  let startDate, endDate, startTime, endTime;
   let picker = null;
   if (useWebPicker) {
     picker = await startControlServer();
@@ -346,19 +346,25 @@ async function main() {
       }
     });
     console.log(`📡 Panel abierto en el navegador (${picker.url})`);
-    ({ startDate, endDate } = await picker.waitForRange());
+    ({ startDate, endDate, startTime, endTime } = await picker.waitForRange());
   } else {
     ({ startDate, endDate } = await askDateRangeTerminal());
   }
-  // Los días se interpretan como días LOCALES (Bogotá) y el día fin es
-  // INCLUSIVO: "13 a 14" toma el 13 completo + el 14 completo. new Date('YYYY-MM-DD')
-  // cae en medianoche UTC → se re-parsea la fecha ISO como medianoche local.
-  const dayStartLocal = (d) => {
+  startTime = startTime || '00:00';
+  endTime = endTime || '23:59';
+  // Las fechas se interpretan SIEMPRE en hora COLOMBIANA (UTC-5, sin DST),
+  // sin importar la zona horaria de la máquina (Windows en otra TZ corría
+  // los días). El día fin es INCLUSIVO: "13 a 14" toma el 13 completo + el 14
+  // completo. startDate/endDate vienen como ISO de medianoche UTC (new Date
+  // de 'YYYY-MM-DD') → el slice del día es estable en cualquier máquina.
+  const toColombiaTs = (d, time) => {
     const [y, m, dd] = d.toISOString().slice(0, 10).split('-').map(Number);
-    return Math.floor(new Date(y, m - 1, dd).getTime() / 1000);
+    const [hh, mi] = String(time || '00:00').split(':').map(Number);
+    return Math.floor(Date.UTC(y, m - 1, dd, hh + 5, mi) / 1000); // 00:00 Colombia = 05:00 UTC
   };
-  const startTs = dayStartLocal(startDate);
-  const endTs = dayStartLocal(endDate) + 86399; // fin del día local (inclusivo)
+  const startTs = toColombiaTs(startDate, startTime);
+  let endTs = toColombiaTs(endDate, endTime);
+  if (endTime === '23:59') endTs += 59; // el default del input = hasta 23:59:59 (inclusivo)
 
   // Borrar el Word de corridas anteriores (mismo patrón que index.js: el archivo
   // viejo del día pasado NO puede confundirse con un resultado nuevo)

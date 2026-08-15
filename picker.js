@@ -212,14 +212,22 @@ const PAGE_HTML = `<!DOCTYPE html>
   $('endDate').value = fmt(now);
 
   function validate() {
-    const s = new Date($('startDate').value + 'T' + ($('startTime').value || '00:00'));
-    const e = new Date($('endDate').value + 'T' + ($('endTime').value || '23:59'));
+    // Fechas como STRING calendario 'YYYY-MM-DD' + hora 'HH:MM': NO se parsean
+    // con new Date(..., 'T', ...) — eso usa la zona horaria de la MÁQUINA y en
+    // una PC fuera de Colombia corre los días (13 → 12). El server interpreta
+    // estas cadenas como hora COLOMBIANA (UTC-5 fijo).
+    const s = $('startDate').value;
+    const e = $('endDate').value;
+    const st = $('startTime').value || '00:00';
+    const et = $('endTime').value || '23:59';
     const msg = $('msg');
-    if (isNaN(s) || isNaN(e)) { msg.textContent = 'Completá las fechas y horas.'; msg.className = 'msg err'; return null; }
-    if (e <= s) { msg.textContent = '❌ La fecha/hora FIN debe ser posterior al INICIO.'; msg.className = 'msg err'; return null; }
-    if (e - s > 7 * DAY) { msg.textContent = '⚠ Supera 1 semana. ¿Estás seguro?'; msg.className = 'msg warn'; }
+    if (!s || !e) { msg.textContent = 'Completá las fechas y horas.'; msg.className = 'msg err'; return null; }
+    if (s > e || (s === e && et <= st)) { msg.textContent = '❌ La fecha/hora FIN debe ser posterior al INICIO.'; msg.className = 'msg err'; return null; }
+    const [sy, sm, sd] = s.split('-').map(Number);
+    const [ey, em, ed2] = e.split('-').map(Number);
+    if ((Date.UTC(ey, em - 1, ed2) - Date.UTC(sy, sm - 1, sd)) / DAY > 7) { msg.textContent = '⚠ Supera 1 semana. ¿Estás seguro?'; msg.className = 'msg warn'; }
     else msg.textContent = '';
-    return { startDate: s.toISOString(), endDate: e.toISOString() };
+    return { startDate: s, startTime: st, endDate: e, endTime: et };
   }
 
   document.querySelectorAll('.presets button').forEach(b => b.addEventListener('click', () => {
@@ -695,17 +703,29 @@ function startControlServer() {
           try { range = JSON.parse(body); }
           catch { sendJson(res, 400, { ok: false, error: 'JSON inválido.' }); return; }
 
-          const startDate = new Date(range?.startDate);
-          const endDate = new Date(range?.endDate);
-          if (isNaN(startDate) || isNaN(endDate)) {
+          // Calendario 'YYYY-MM-DD' (nuevo frontend) o ISO completo (clientes
+          // viejos/tests) + 'HH:MM' como STRING: el día se compara como cadena,
+          // independiente de la zona horaria de la máquina (el rango se
+          // interpreta en Colombia, ver main en index-evolution.js).
+          const sd = String(range?.startDate || '').slice(0, 10);
+          const ed = String(range?.endDate || '').slice(0, 10);
+          // Si el cliente no manda hora explícita, tomarla del ISO (clientes
+          // viejos/tests) — mismo día con fin antes del inicio sigue siendo 400.
+          const isoTime = (s) => { const m = String(s).match(/T(\d{2}:\d{2})/); return m ? m[1] : ''; };
+          const st = String(range?.startTime || '') || isoTime(range?.startDate) || '00:00';
+          const et = String(range?.endTime || '') || isoTime(range?.endDate) || '23:59';
+          if (!/^\d{4}-\d{2}-\d{2}$/.test(sd) || !/^\d{4}-\d{2}-\d{2}$/.test(ed) ||
+              !/^\d{2}:\d{2}$/.test(st) || !/^\d{2}:\d{2}$/.test(et)) {
             sendJson(res, 400, { ok: false, error: 'Fechas inválidas.' }); return;
           }
-          if (endDate <= startDate) {
+          if (sd > ed || (sd === ed && et <= st)) {
             sendJson(res, 400, { ok: false, error: 'La fecha/hora FIN debe ser posterior al INICIO.' }); return;
           }
 
           sendJson(res, 200, { ok: true });
-          handle._range = { startDate, endDate };
+          const startDate = new Date(range.startDate); // round-trip del string original
+          const endDate = new Date(range.endDate);
+          handle._range = { startDate, startTime: st, endDate, endTime: et };
           const waiters = handle._waiters;
           handle._waiters = [];
           waiters.forEach(w => w(handle._range));
