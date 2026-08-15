@@ -335,9 +335,9 @@ async function main() {
     // Selector de instancias: lista las que existen en Evolution (la crea el
     // usuario en la UI del VPS) para elegir la que se acaba de hacer.
     picker.setInstanceLister(async () => {
-      const list = await evo.listInstances();
-      if (list.error) return [];
-      return list;
+      // El error se propaga al panel (auth/DNS/red) — tragar el error hacía
+      // creer que no había instancias cuando la key estaba mal.
+      return evo.listInstances();
     });
     picker.setConfigApplied(({ changed }) => {
       if (changed) {

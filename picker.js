@@ -414,6 +414,15 @@ const PAGE_HTML = `<!DOCTYPE html>
         try {
           const ri = await fetch('/api/instances');
           const ji = await ri.json();
+          // Error del proveedor (key mal, DNS, red) → mostrarlo; un selector
+          // vacío sin explicación confunde ("no hay instancias" ≠ "no conecta").
+          if (ji.error) {
+            instSel.innerHTML = '';
+            const e = document.createElement('option');
+            e.value = ''; e.textContent = '❌ Evolution: ' + ji.error;
+            instSel.appendChild(e);
+            return;
+          }
           const opts = (ji.instances || []).filter(i => i.name);
           instSel.innerHTML = '';
           const realNames = new Set(opts.map(i => i.name));
@@ -739,12 +748,18 @@ function startControlServer() {
         return;
       }
 
-      // Instancias existentes en Evolution (selector del panel)
+      // Instancias existentes en Evolution (selector del panel). Un error del
+      // proveedor (auth/DNS) viaja como {error} — no se oculta: el panel lo
+      // muestra para no confundir "no hay instancias" con "no conecta".
       if (req.method === 'GET' && req.url === '/api/instances') {
         if (!handle._instanceLister) { sendJson(res, 200, { ok: true, instances: [] }); return; }
         Promise.resolve(handle._instanceLister())
-          .then(list => sendJson(res, 200, { ok: true, instances: list || [] }))
-          .catch(() => sendJson(res, 200, { ok: true, instances: [] }));
+          .then(list => sendJson(res, 200, {
+            ok: true,
+            instances: Array.isArray(list) ? list : [],
+            error: list && !Array.isArray(list) && list.error ? list.error : null,
+          }))
+          .catch(e => sendJson(res, 200, { ok: true, instances: [], error: e.message }));
         return;
       }
 
